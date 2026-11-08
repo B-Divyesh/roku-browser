@@ -199,7 +199,7 @@ setup if you only want Lite mode.
 | Arrows | Move the cursor (hold to speed up). Links and buttons light up under it; push past an edge to scroll |
 | OK | Click. Clicking a text box opens the keyboard |
 | Play/Pause | Search or type an address |
-| ✱ (Options) | Menu: search, play the page's video on the TV, forward, reload, text size, start page, exit |
+| ✱ (Options) | Menu: search, play the page's video on the TV, show the laptop's screen, forward, reload, text size, start page, exit |
 | Rewind / Fast-forward | Page up / page down |
 | Instant replay ↺ | Reload |
 | Back | Go back; press twice on the first page to exit |
@@ -227,6 +227,46 @@ roku shot                      # screenshot of the Browser app
 
 Optional: install `yt-dlp` and the menu's *Find video on this page* can play videos from
 most video sites in the Roku's player.
+
+## Show your laptop's screen on the TV
+
+The Roku's own *Screen mirroring* is Miracast, which Linux can't use with a Roku: the Roku
+already runs its own Wi-Fi Direct group, and NetworkManager can only start a new one, never
+join it. Most 4K Rokus also speak **AirPlay**, though, and roku-browser mirrors through that
+with [doubletake](https://github.com/omarroth/doubletake), an AirPlay sender for Linux. Your
+whole screen appears on the TV with its sound, about a fifth of a second behind.
+
+You need:
+
+- AirPlay on the Roku: *Settings → Apple AirPlay and HomeKit → AirPlay: On*. To check:
+  `curl -s http://ROKU-IP:8060/query/device-info | grep airplay` should say `true`.
+- doubletake on the laptop: on Arch, `yay -S doubletake-bin`; elsewhere see its README.
+- GStreamer's GPU video encoder. On Arch that's `sudo pacman -S gst-plugin-va`; on
+  Debian/Ubuntu, `gstreamer1.0-plugins-bad` with a VA-API driver. roku-browser won't mirror
+  without it (see the warning below).
+- A Wayland desktop with a screen-sharing portal (GNOME, KDE, Hyprland, Sway…).
+
+Then:
+
+```sh
+roku mirror        # show this screen on the TV
+roku mirror stop   # stop
+```
+
+The first time, your desktop asks which screen to share (you have 25 seconds), and the TV
+shows a four-digit code to type in at the laptop. After that, `roku mirror` needs no clicks.
+On the TV, ✱ → *Show laptop screen* does the same. **Back** or **Home** on the remote ends
+it. While mirroring, sound plays from the TV only, and comes back to the laptop when it ends.
+A desktop notification shows whenever your screen is on the TV.
+
+If the Roku has no AirPlay or doubletake isn't installed, roku-browser falls back to playing
+your screen in the Browser app's video player. It runs about 6 seconds behind, because the
+Roku's player always keeps a few seconds in hand, and needs `wf-recorder`.
+
+> **Hyprland users:** on Hyprland 0.57.1, screen capture into shared-memory buffers froze the
+> whole desktop twice while this was being built. Capture on the GPU didn't. So roku-browser
+> only mirrors when it can encode on the GPU, and ends mirroring as soon as the TV leaves its
+> AirPlay screen.
 
 ## Troubleshooting
 
@@ -260,6 +300,9 @@ most video sites in the Roku's player.
 - The service only answers this laptop and Roku devices. Before serving any other address
   on the network, it checks that the address really is a Roku.
 - The hidden browser closes after 15 minutes without use.
+- Mirroring sends your screen only to the Roku you set up. Over AirPlay it's encrypted, and
+  the TV asks for a pairing code the first time. In the fallback, the stream's address is a
+  one-off secret that only that Roku is told.
 
 ## Uninstall
 
@@ -273,7 +316,8 @@ most video sites in the Roku's player.
 ```
 server/roku_browser.py   laptop service: headless browser over the DevTools protocol, frame
                          capture (PNG → 4:4:4 JPEG), click targets, input, video hand-off,
-                         UDP discovery, HTTP API for the Roku app and the roku command
+                         UDP discovery, HTTP API for the Roku app and the roku command,
+                         screen mirroring (AirPlay via doubletake, or HLS for the Roku's player)
 channel/                 the Roku app (SceneGraph + BrightScript)
   components/BrowserScene  page frames (double-buffered), cursor, highlights, menu, keyboard, video
   components/PollTask      long-polls the laptop for new frames; finds it by broadcast

@@ -26,6 +26,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import aiohttp
+import yarl
 from aiohttp import web
 from PIL import Image
 
@@ -985,8 +986,10 @@ class Browser:
     async def ecp(self, path, method="POST"):
         if not self.roku_ip:
             raise web.HTTPServiceUnavailable(text="Roku address unknown; set \"roku\" in config.json")
-        async with self.http.request(method, f"http://{self.roku_ip}:8060/{path}",
-                                     timeout=aiohttp.ClientTimeout(total=5)) as r:
+        # Sent exactly as given: the Roku answers 404 to an input whose parameters have
+        # bare ":" and "/", which is what aiohttp would otherwise turn "%3A%2F" back into.
+        url = yarl.URL(f"http://{self.roku_ip}:8060/{path}", encoded=True)
+        async with self.http.request(method, url, timeout=aiohttp.ClientTimeout(total=5)) as r:
             return r.status, await r.text()
 
     def base_url(self):
@@ -1000,6 +1003,15 @@ class Browser:
         _, active = await self.ecp("query/active-app", "GET")
         if 'id="dev"' not in active:
             await self.ecp(f"launch/dev?server={quote(self.base_url(), safe='')}")
+
+    async def mirror_on_tv(self, on):
+        """Has the Browser channel play (or stop) the mirror's video; it asks for the stream itself."""
+        _, active = await self.ecp("query/active-app", "GET")
+        args = f"mirror={int(on)}&server={quote(self.base_url(), safe='')}"
+        if 'id="dev"' in active:
+            await self.ecp(f"input?{args}")
+        elif on:
+            await self.ecp(f"launch/dev?{args}")
 
     async def is_roku(self, ip):
         hit = self.roku_cache.get(ip)
@@ -1065,6 +1077,389 @@ class Remuxer:
             self.proc.kill()
 
 
+async def command_output(*args, env=None, timeout=10):
+    """A quick helper command's output, or "" if it's missing or fails."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, env=env)
+    except OSError:
+        return ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return ""
+    return out.decode(errors="replace").strip() if proc.returncode == 0 else ""
+
+
+async def session_env():
+    """The desktop's variables. The service can start before the desktop shares them."""
+    env = dict(os.environ)
+    if not env.get("WAYLAND_DISPLAY"):
+        for line in (await command_output("systemctl", "--user", "show-environment")).splitlines():
+            key, _, value = line.partition("=")
+            if key in ("WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK"):
+                env.setdefault(key, value)
+    if not env.get("WAYLAND_DISPLAY"):
+        runtime = Path(env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+        sockets = sorted(p.name for p in runtime.glob("wayland-*") if not p.name.endswith(".lock"))
+        if sockets:
+            env["WAYLAND_DISPLAY"] = sockets[0]
+    return env
+
+
+def notify(title, body=""):
+    """A desktop notification, so it's always clear when the screen is on the TV."""
+    if shutil.which("notify-send"):
+        asyncio.create_task(command_output("notify-send", "-a", "Roku", "-i", "video-display", title, body))
+
+
+MIRROR_SINK = "roku_mirror"
+RENDER_NODE = "/dev/dri/renderD128"
+
+
+def find_tool(name):
+    """A program on PATH or in ~/.local/bin, which a service's PATH may lack."""
+    return shutil.which(name) or shutil.which(name, path=str(Path.home() / ".local/bin"))
+
+
+class MirrorError(Exception):
+    pass
+
+
+class PairingNeeded(MirrorError):
+    """The TV is showing an AirPlay code; it has to be typed in on the laptop once."""
+
+
+class Mirror:
+    """Shows this laptop's screen on the TV, with its sound.
+
+    The Roku's own mirroring (Miracast) can't be reached from Linux: the Roku runs its own
+    Wi-Fi Direct group, and NetworkManager only negotiates new ones. Two ways round it:
+
+    - AirPlay, on Rokus that have it: doubletake, an AirPlay sender, captures the screen
+      through the desktop's screen-sharing portal. A fraction of a second behind.
+    - Otherwise the Roku's video player: wf-recorder encodes on the GPU and ffmpeg cuts
+      half-second HLS segments. The player keeps a few seconds in hand, so ~6 s behind.
+
+    Either way, sound moves to a virtual "Roku TV" output meanwhile, so it plays on the TV
+    rather than the laptop, and comes back when mirroring ends: when asked, when the TV
+    ends it, or when the TV stops watching.
+    """
+
+    def __init__(self, browser):
+        self.b = browser
+        self.dir = DATA / "mirror"
+        self.socket = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "roku-browser-airplay.sock"
+        self.kind = None                # "airplay" or "video" while mirroring
+        self.state = ""                 # doubletake's: connecting, pin_required, streaming, idle
+        self.asked_code = 0.0           # when the TV started showing a pairing code
+        self.shown = False              # the TV got as far as showing the screen
+        self.away = 0                   # checks in a row that found the TV off its AirPlay screen
+        self.was_on_tv = ""             # the app the TV showed before AirPlay took over
+        self.airplay = None             # the doubletake daemon
+        self.token = None               # secret part of the video stream's address
+        self.rec = self.seg = None      # wf-recorder | ffmpeg for the video player
+        self.module = None              # pactl module of the virtual sound output
+        self.prev_sink = ""
+        self.last_fetch = 0.0
+        self.lock = asyncio.Lock()      # the TV and the laptop can both ask at once
+
+    @property
+    def running(self):
+        if self.kind == "airplay":
+            return self.airplay is not None and self.airplay.returncode is None and \
+                self.state in ("connecting", "pin_required", "streaming")
+        return self.seg is not None and self.seg.returncode is None
+
+    def path(self):
+        return f"/mirror/{self.token}/index.m3u8"
+
+    def owns(self, token):
+        return self.token is not None and secrets.compare_digest(token, self.token)
+
+    async def start(self):
+        """Starts mirroring and says how: "airplay", or "video" for the Browser channel to play."""
+        async with self.lock:
+            if self.running:
+                return self.kind
+            await self.stop()
+            if await self._airplay_available():
+                await self._start_airplay()
+            else:
+                await self._start_video()
+            return self.kind
+
+    async def pair(self, code):
+        """The code shown on the TV the first time this laptop mirrors to it over AirPlay."""
+        async with self.lock:
+            if self.kind != "airplay" or self.state != "pin_required":
+                raise MirrorError("The TV isn't waiting for a code. Run “roku mirror” again.")
+            await self._ctl("pin", code)
+            await self._until_streaming()
+
+    async def stop(self):
+        if self.kind is None and self.module is None:
+            return
+        shown, ended_here = self.shown, self.running
+        if self.airplay is not None:
+            if self.airplay.returncode is None:
+                await self._ctl("disconnect", timeout=5)
+            await self._end(self.airplay)
+            self.airplay = None
+            if ended_here:
+                await self._tv_back()
+        await self._kill()
+        await self._sound_back()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.kind, self.state, self.token, self.shown, self.away = None, "", None, False, 0
+        if shown:
+            log.info("mirroring stopped")
+            notify("Stopped showing this screen on the TV")
+
+    async def check(self):
+        """Called every few seconds while mirroring: ends it once the TV has."""
+        if self.kind is None or self.lock.locked():
+            return
+        if self.kind == "airplay":
+            if self.airplay is not None and self.airplay.returncode is None:
+                self.state = (await self._ctl("status", timeout=5)).get("state", "")
+            if self.state == "streaming":
+                # Back or Home leaves AirPlay running unseen, and doubletake rebuilds its
+                # capture when the Roku drops it; that churn preceded a Hyprland freeze.
+                try:
+                    _, active = await self.b.ecp("query/active-app", "GET")
+                    self.away = 0 if "AirPlay" in active else self.away + 1
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+                if self.away >= 2:
+                    await self.stop()
+                    return
+            unanswered = self.state == "pin_required" and time.monotonic() - self.asked_code > 180
+            if not self.running or unanswered:
+                await self.stop()       # Home on the remote, say, ended the AirPlay session
+        elif not self.running or time.monotonic() - self.last_fetch > 30:
+            await self.stop()           # the capture died, or the TV stopped watching
+
+    # ---- AirPlay ---------------------------------------------------------
+
+    async def _airplay_available(self):
+        if not (find_tool("doubletake") and find_tool("doubletake-ctl") and self.b.roku_ip):
+            return False
+        if not await command_output("gst-inspect-1.0", "vah264enc"):
+            # Without GStreamer's GPU encoder the capture falls back to shared-memory
+            # buffers, and that is how Hyprland 0.57.1 froze, twice, on 2026-11-08.
+            raise MirrorError("AirPlay mirroring needs GStreamer's GPU encoder first: "
+                              "sudo pacman -S gst-plugin-va")
+        try:
+            async with self.b.http.get(f"http://{self.b.roku_ip}:7000/info",
+                                       timeout=aiohttp.ClientTimeout(total=2)) as r:
+                return r.status == 200
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return False
+
+    async def _start_airplay(self):
+        self.kind, self.state = "airplay", "connecting"
+        try:
+            _, active = await self.b.ecp("query/active-app", "GET")
+            found = re.search(r'<app id="([^"]+)"', active)
+            self.was_on_tv = found.group(1) if found else ""
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self.was_on_tv = ""
+        if self.airplay is None or self.airplay.returncode is not None:
+            self.socket.unlink(missing_ok=True)
+            self.dir.mkdir(parents=True, exist_ok=True)
+            with open(self.dir / "airplay.log", "wb") as errors:
+                self.airplay = await asyncio.create_subprocess_exec(
+                    find_tool("doubletake"), "-daemonize", "-socket", str(self.socket), "-hwaccel", "vaapi",
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=errors,
+                    env=await session_env(), preexec_fn=die_with_parent)
+            for _ in range(50):
+                if self.socket.exists():
+                    break
+                await asyncio.sleep(0.1)
+        await self._sound_to_tv()       # first: doubletake records whatever the default output is
+        await self._ctl("connect", self.b.roku_ip)
+        await self._until_streaming()
+
+    async def _until_streaming(self):
+        # The first time, the desktop asks which screen to share (doubletake allows two
+        # minutes) and the TV shows a pairing code. Later runs need neither.
+        for _ in range(260):
+            status = await self._ctl("status", timeout=5)
+            self.state = status.get("state", "")
+            if self.state == "streaming":
+                self.shown = True
+                log.info("mirroring to the TV over AirPlay")
+                notify("Showing this screen on the TV",
+                       "Sound plays from the TV. To stop, press Home on the Roku remote or run “roku mirror stop”.")
+                return
+            if self.state == "pin_required":
+                self.asked_code = time.monotonic()
+                raise PairingNeeded("The TV is showing a code. Type it in on the laptop: roku mirror")
+            if self.state == "idle" or self.airplay.returncode is not None:
+                reason = status.get("error") or "doubletake stopped"
+                await self.stop()
+                raise MirrorError(f"Couldn't start AirPlay mirroring: {reason}")
+            await asyncio.sleep(0.5)
+        await self.stop()
+        raise MirrorError("AirPlay mirroring took too long to start.")
+
+    async def _tv_back(self):
+        """Ended from the laptop, the Roku would sit on its AirPlay screen; go back to
+        what it showed before."""
+        try:
+            _, active = await self.b.ecp("query/active-app", "GET")
+            if "AirPlay" not in active:
+                return
+            if self.was_on_tv == "dev":
+                await self.b.ecp(f"launch/dev?server={quote(self.b.base_url(), safe='')}")
+            else:
+                await self.b.ecp("keypress/Home")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass
+
+    async def _ctl(self, *args, timeout=30):
+        out = await command_output(find_tool("doubletake-ctl") or "doubletake-ctl", "-socket", str(self.socket),
+                                   *args, timeout=timeout)
+        try:
+            return json.loads(out)
+        except ValueError:
+            return {}
+
+    # ---- the Roku's video player -----------------------------------------
+
+    async def _start_video(self):
+        if not shutil.which("wf-recorder"):
+            raise MirrorError("Showing the laptop screen needs doubletake (for AirPlay) or wf-recorder.")
+        env = await session_env()
+        output = await self._output(env)
+        self.kind = "video"
+        self.token = secrets.token_urlsafe(16)
+        self.last_fetch = time.monotonic()
+        out = self.dir / self.token
+        out.mkdir(parents=True)
+        monitor = await self._sound_to_tv()
+        # GPU buffers only: the CPU route captures through shared memory (see _airplay_available).
+        for gpu in (True,) if os.path.exists(RENDER_NODE) else ():
+            await self._spawn(out, output, monitor, gpu, env)
+            if await self._first_segments(out):
+                break
+            await self._kill()
+        else:
+            reason = self._last_error() or "this laptop has no GPU video encoder"
+            await self.stop()
+            raise MirrorError(f"Couldn't capture the laptop screen: {reason}")
+        self.last_fetch = time.monotonic()
+        self.shown = True
+        log.info("mirroring %s to the TV's video player, encoding on the %s", output or "the screen",
+                 "GPU" if gpu else "CPU")
+        notify("Showing this screen on the TV",
+               "Sound plays from the TV. To stop, press Back on the Roku remote or run “roku mirror stop”.")
+
+    async def _output(self, env):
+        """The screen to show: Hyprland's focused monitor, else the first wf-recorder lists."""
+        try:
+            monitors = json.loads(await command_output("hyprctl", "monitors", "-j", env=env))
+            return next(m["name"] for m in monitors if m.get("focused"))
+        except (ValueError, StopIteration, KeyError, TypeError):
+            pass
+        found = re.search(r"Name: (\S+)", await command_output("wf-recorder", "-L", env=env))
+        return found.group(1) if found else None
+
+    async def _spawn(self, out, output, monitor, gpu, env):
+        fit = "w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2"
+        if gpu:
+            video = ["-c", "h264_vaapi", "-d", RENDER_NODE, "-F", f"scale_vaapi={fit}:format=nv12:out_range=tv",
+                     "-p", "rc_mode=VBR", "-p", "b=6000000", "-p", "maxrate=9000000"]
+        else:
+            video = ["-c", "libx264", "-x", "yuv420p", "-F", f"scale={fit}:out_range=tv",
+                     "-p", "preset=veryfast", "-p", "tune=zerolatency", "-p", "b=5000000"]
+        # Constant 30 fps with a keyframe every half second, so every segment can start playback.
+        rec = ["wf-recorder", *(["-o", output] if output else []), *video, "-r", "30", "-b", "0", "-p", "g=15"]
+        if monitor:
+            rec += [f"--audio={monitor}", "-C", "aac"]
+        rec += ["-m", "mpegts", "-f", "pipe:1"]
+        read, write = os.pipe()
+        with open(self.dir / "capture.log", "ab") as errors:
+            self.seg = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-loglevel", "error",
+                # Start writing at once instead of studying the first five seconds.
+                "-fflags", "nobuffer", "-analyzeduration", "500000", "-probesize", "500000",
+                "-i", "pipe:0", "-c", "copy",
+                # The encoder labels its limited-range picture as full range; TVs would wash it out.
+                "-bsf:v", "h264_metadata=video_full_range_flag=0",
+                "-f", "hls", "-hls_time", "0.5", "-hls_list_size", "6",
+                "-hls_flags", "delete_segments+independent_segments+omit_endlist",
+                "-hls_segment_filename", str(out / "seg%05d.ts"), str(out / "index.m3u8"),
+                stdin=read, stdout=asyncio.subprocess.DEVNULL, stderr=errors, preexec_fn=die_with_parent)
+            self.rec = await asyncio.create_subprocess_exec(
+                *rec, stdin=asyncio.subprocess.DEVNULL, stdout=write, stderr=errors, env=env,
+                preexec_fn=die_with_parent)
+        os.close(read)
+        os.close(write)
+
+    async def _first_segments(self, out):
+        index = out / "index.m3u8"
+        for _ in range(60):
+            if index.exists() and index.read_text().count("#EXTINF") >= 2:
+                return True
+            if self.rec.returncode is not None or self.seg.returncode is not None:
+                return False
+            await asyncio.sleep(0.2)
+        return False
+
+    def _last_error(self):
+        try:
+            lines = (self.dir / "capture.log").read_text(errors="replace").splitlines()
+        except OSError:
+            return ""
+        return next((ln.strip() for ln in reversed(lines) if "rror" in ln), "")[:160]
+
+    async def _kill(self):
+        await asyncio.gather(*(self._end(p) for p in (self.rec, self.seg) if p is not None))
+        self.rec = self.seg = None
+
+    @staticmethod
+    async def _end(proc):
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+
+    async def _sound_to_tv(self):
+        """A virtual output for the TV, made the default so apps' sound moves to it."""
+        if not shutil.which("pactl"):
+            return None
+        await self.drop_leftovers()
+        self.prev_sink = await command_output("pactl", "get-default-sink")
+        module = await command_output("pactl", "load-module", "module-null-sink", f"sink_name={MIRROR_SINK}",
+                                      """sink_properties='device.description="Roku TV"'""")
+        if not module.isdigit():
+            return None
+        self.module = module
+        await command_output("pactl", "set-default-sink", MIRROR_SINK)
+        return MIRROR_SINK + ".monitor"
+
+    async def _sound_back(self):
+        if self.module is None:
+            return
+        if self.prev_sink and self.prev_sink != MIRROR_SINK:
+            await command_output("pactl", "set-default-sink", self.prev_sink)
+        await command_output("pactl", "unload-module", self.module)
+        self.module = None
+
+    @staticmethod
+    async def drop_leftovers():
+        """Removes a virtual output left behind by a crash, so sound comes back to the laptop."""
+        for line in (await command_output("pactl", "list", "short", "modules")).splitlines():
+            if "module-null-sink" in line and f"sink_name={MIRROR_SINK}" in line:
+                await command_output("pactl", "unload-module", line.split()[0])
+
+
 class Discovery(asyncio.DatagramProtocol):
     """Answers the channel's broadcast so it finds the laptop after an IP change."""
 
@@ -1125,6 +1520,8 @@ def make_app(b):
         return web.Response(body=b.jpeg, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     async def input_(req):
+        if req.query.get("t") == "mirror":
+            return web.json_response(await mirror_for_tv(req))
         await b.ensure()
         try:
             return web.json_response(await b.handle(req.query.get("t", ""), req.query) or {})
@@ -1209,8 +1606,71 @@ def make_app(b):
             raise web.HTTPNotFound()
         return web.FileResponse(p, headers={"Content-Type": mimetypes.guess_type(p.name)[0] or "video/mp4"})
 
+    async def mirror_for_tv(req):
+        """The channel asking to show this laptop's screen (on=1) or to stop (on=0)."""
+        if req.query.get("on", "1") != "1":
+            await mirror.stop()
+            return {}
+        # Only this laptop's own Roku may watch its screen, not anything that answers like one.
+        if b.roku_ip and req.remote not in (b.roku_ip, "127.0.0.1", "::1"):
+            raise web.HTTPForbidden(text="only this laptop's Roku can show its screen")
+        try:
+            kind = await mirror.start()
+        except PairingNeeded:
+            return {"notice": "The first time, pair on the laptop: run “roku mirror” and type in the code on the TV"}
+        except MirrorError as e:
+            return {"notice": str(e)}
+        if kind == "airplay":
+            return {"airplay": True}    # the Roku's AirPlay screen takes over from the channel
+        return {"play": {"url": b.base_url() + mirror.path(), "format": "hls", "title": "Laptop screen",
+                         "headers": [], "live": True, "mirror": True}}
+
+    async def mirror_(req):
+        """`roku mirror [stop]` on this laptop."""
+        if req.remote not in ("127.0.0.1", "::1"):
+            raise web.HTTPForbidden()
+        body = await req.json()
+        on, kind = body.get("on", True), mirror.kind
+        try:
+            if body.get("code"):
+                await mirror.pair(body["code"])
+                kind = mirror.kind
+            elif on:
+                kind = await mirror.start()
+            else:
+                await mirror.stop()
+        except PairingNeeded as e:
+            return web.json_response({"ok": False, "pair": True, "error": str(e)})
+        except MirrorError as e:
+            return web.json_response({"ok": False, "error": str(e)})
+        if kind != "video":
+            return web.json_response({"ok": True, "via": kind or ""})
+        try:
+            await b.mirror_on_tv(on)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await mirror.stop()
+            return web.json_response({"ok": False, "error": "Couldn't reach the Roku. Is it on?"})
+        return web.json_response({"ok": True, "via": "video"})
+
+    async def mirror_file(req):
+        token, name = req.match_info["token"], req.match_info["name"]
+        path = mirror.dir / token / name
+        if not mirror.owns(token) or "/" in name or not path.is_file():
+            raise web.HTTPNotFound()
+        mirror.last_fetch = time.monotonic()
+        if name.endswith(".m3u8"):
+            # Players stay about three segments behind the newest, so half-second segments
+            # halve the delay. ffmpeg rounds their target duration down to 0, which a Roku
+            # refuses; 1 is what it accepts.
+            text = path.read_text().replace("#EXT-X-TARGETDURATION:0\n", "#EXT-X-TARGETDURATION:1\n")
+            return web.Response(text=text, content_type="application/vnd.apple.mpegurl",
+                                headers={"Cache-Control": "no-store"})
+        return web.FileResponse(path, headers={"Content-Type": "video/mp2t", "Cache-Control": "no-store"})
+
     remuxer = Remuxer()
     b.remuxer = remuxer
+    mirror = Mirror(b)
+    b.mirror = mirror
     app = web.Application(middlewares=[guard])
     app.add_routes([
         web.get("/hello", hello), web.get("/start", start), web.get("/poll", poll), web.get(r"/frame/{n}.jpg", frame),
@@ -1218,6 +1678,7 @@ def make_app(b):
         web.post("/type", type_), web.post("/cast", cast), web.get("/file/{token}/{name}", file),
         web.get("/remux", remux), web.get("/remux/{key}/{name}", remux_file),
         web.get("/dailymotion/{id}", dailymotion),
+        web.post("/mirror", mirror_), web.get("/mirror/{token}/{name}", mirror_file),
     ])
     return app
 
@@ -1227,6 +1688,8 @@ async def watchdog(b):
     while True:
         await asyncio.sleep(1.5)
         tick += 1
+        if tick % 2 == 0:
+            await b.mirror.check()
         if b.running and not b.paused and b.active:
             b.mark_dirty()              # cheap heartbeat; unchanged frames aren't sent
             asyncio.create_task(b.refresh_info(b.active))
@@ -1252,6 +1715,7 @@ async def main():
     await loop.create_datagram_endpoint(lambda: Discovery(cfg["port"]),
                                         local_addr=("0.0.0.0", cfg["discovery_port"]),
                                         reuse_port=True, allow_broadcast=True)
+    await Mirror.drop_leftovers()
     dog = asyncio.create_task(watchdog(b))
     log.info("listening on :%d (discovery :%d)", cfg["port"], cfg["discovery_port"])
     done = asyncio.Event()
@@ -1260,6 +1724,7 @@ async def main():
     await done.wait()
     dog.cancel()
     b.remuxer.stop()
+    await b.mirror.stop()
     await b.stop()
     await b.http.close()
     await runner.cleanup()

@@ -77,6 +77,8 @@ sub init()
     m.lastMove = 0
     m.seq = 0
     m.server = ""
+    m.mirroring = false     ' the video playing is the laptop's screen
+    m.pendingMirror = false
     m.state = {frame: 0, url: "", label: "", title: "", host: "", loading: false, back: false, fwd: false, tabs: 1, zoom: 125, video: ""}
     m.boot = ""
     m.wantFrame = ""
@@ -134,6 +136,8 @@ sub onLaunchArgs()
     else
         m.top.findNode("fallbackTimer").control = "start"
     end if
+    ' Asked for once the laptop answers; the command task is only just starting.
+    if args <> invalid and args.mirror = "1" then m.pendingMirror = true
 end sub
 
 sub onFallback()
@@ -162,7 +166,8 @@ sub enterLite(message as string)
     else if m.lite.status = invalid
         m.lite.navigate = {url: "lite:start"}
     end if
-    m.lite.setFocus(true)
+    ' A video started at launch (the laptop's screen, say) keeps the remote.
+    if not m.video.visible then m.lite.setFocus(true)
     if message <> "" then showNotice(message)
     if not m.hintsChecked then hintsOnLaunch()
 end sub
@@ -177,7 +182,7 @@ sub enterFull()
     m.cursor.visible = true
     m.hover = invalid
     placeCursor()
-    m.top.setFocus(true)
+    if not m.video.visible then m.top.setFocus(true)
     if not m.online
         m.offline.opacity = 1
         m.spinner.control = "start"
@@ -228,7 +233,17 @@ end sub
 sub onInputArgs()
     args = m.top.inputArgs
     if args = invalid then return
-    if args.server <> invalid and args.server <> "" then m.poll.server = args.server
+    if args.server <> invalid and args.server <> ""
+        m.poll.server = args.server
+        m.cmd.server = args.server
+    end if
+    if args.mirror = "1"
+        startMirror()
+    else if args.mirror = "0" and m.mirroring
+        m.mirroring = false
+        stopVideo()
+        showNotice("Stopped showing the laptop screen")
+    end if
     if args.mode = "lite" and m.mode <> "lite" then enterLite("")
     if args.mode = "full" and m.mode <> "full" then enterFull()
     if args.url <> invalid and args.url <> ""
@@ -256,6 +271,10 @@ sub onOnline()
     m.laptopAvailable = online
     ' Lite mode borrows the laptop for what the Roku can't do alone (Dailymotion sound).
     if online then m.lite.helper = m.server else m.lite.helper = ""
+    if online and m.pendingMirror
+        m.pendingMirror = false
+        startMirror()
+    end if
     if m.mode = "lite"
         if online and not m.toldLaptop
             m.toldLaptop = true
@@ -565,6 +584,7 @@ sub onResult()
     end if
     if reply.edit <> invalid then openFieldKeyboard(reply.edit)
     if reply.play <> invalid then playVideo(reply.play)
+    if reply.airplay = true then hideNotice()
     if reply.notice <> invalid then showNotice(reply.notice)
 end sub
 
@@ -650,6 +670,7 @@ sub openMenu(focusId = "" as string)
     s = m.state
     items = [{id: "address", title: "Search or enter address", value: ""}]
     if s.video <> invalid and s.video <> "" then items.push({id: "video", title: s.video, value: ""})
+    items.push({id: "mirror", title: "Show laptop screen", value: ""})
     if s.fwd = true then items.push({id: "forward", title: "Forward", value: ""})
     items.push({id: "reload", title: "Reload", value: ""})
     items.push({id: "zoom", title: "Text size", value: s.zoom.toStr() + "%"})
@@ -669,7 +690,10 @@ sub openLiteMenu(focusId as string)
     items.push({id: "reload", title: "Reload", value: ""})
     items.push({id: "zoom", title: "Text size", value: Int(m.liteScale * 100 + 0.5).toStr() + "%"})
     items.push({id: "home", title: "Start page", value: ""})
-    if m.laptopAvailable then items.push({id: "full", title: "Full browser (laptop)", value: ""})
+    if m.laptopAvailable
+        items.push({id: "full", title: "Full browser (laptop)", value: ""})
+        items.push({id: "mirror", title: "Show laptop screen", value: ""})
+    end if
     items.push({id: "help", title: "Remote buttons", value: ""})
     items.push({id: "exit", title: "Exit Browser", value: ""})
     title = "Lite mode"
@@ -727,6 +751,11 @@ end sub
 
 sub onMenuSelect()
     id = m.menuItems[m.menuList.itemSelected].id
+    if id = "mirror"
+        closeMenu()
+        startMirror()
+        return
+    end if
     if m.mode = "lite"
         onLiteMenuSelect(id)
         return
@@ -788,12 +817,25 @@ end sub
 
 ' ---- video --------------------------------------------------------------
 
+' The laptop's screen, with its sound: over AirPlay, which takes over the TV, or as a
+' live stream for this channel's player.
+sub startMirror()
+    showNotice("Getting your laptop's screen…")
+    ' The first time, the laptop asks which screen to share; that can take a while.
+    send("mirror", {on: 1}, 190000)
+end sub
+
 sub playVideo(p as object)
     content = CreateObject("roSGNode", "ContentNode")
     content.url = p.url
     content.streamFormat = p.format
     if p.title <> invalid then content.title = p.title
     if p.headers <> invalid and p.headers.count() > 0 then content.HttpHeaders = p.headers
+    if p.live = true
+        content.live = true
+        content.PlayStart = 100000
+    end if
+    m.mirroring = (p.mirror = true)
     hideNotice()
     m.video.content = content
     m.video.visible = true
@@ -804,6 +846,11 @@ sub playVideo(p as object)
 end sub
 
 sub stopVideo()
+    if m.mirroring
+        ' Stop capturing now, which also gives the laptop its sound back.
+        m.mirroring = false
+        send("mirror", {on: 0})
+    end if
     m.video.control = "stop"
     m.video.visible = false
     if m.mode <> "lite"
@@ -818,8 +865,13 @@ sub onVideoState()
     st = m.video.state
     if st = "error"
         print "video error: "; m.video.errorCode; " "; m.video.errorMsg
+        mirroring = m.mirroring
         stopVideo()
-        showNotice("Couldn't play this video")
+        if mirroring
+            showNotice("The laptop stopped showing its screen")
+        else
+            showNotice("Couldn't play this video")
+        end if
     else if st = "finished"
         stopVideo()
     end if
@@ -892,6 +944,8 @@ end sub
 
 sub hideNotice()
     m.noticeTimer.control = "stop"
+    ' A notice still fading in would otherwise finish appearing and stay.
+    m.anim.noticeIn.control = "stop"
     if m.notice.opacity > 0 then m.anim.noticeOut.control = "start"
 end sub
 

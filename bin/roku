@@ -9,6 +9,8 @@
   roku browser             open the Browser app on the TV, connected to this laptop
   roku open URL|SEARCH     show a web page in the Browser app
   roku play URL|FILE       play a video on the TV (YouTube links open the YouTube app)
+  roku mirror [stop]       show this laptop's screen on the TV, with its sound (AirPlay when the
+                           Roku has it and doubletake is installed; else about 6 s behind)
   roku launch APP [ID]     open an app by name or id, optionally straight to a video/show id
   roku apps                list installed apps
   roku now                 what's on screen and what's playing
@@ -107,11 +109,11 @@ def active_app():
     return m.groups() if m else ("", "Home")
 
 
-def browser_service(path, body):
+def browser_service(path, body, timeout=60):
     req = urllib.request.Request(SERVER + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.URLError as e:
         sys.exit(f"roku-browser isn't running ({e.reason}). Start it: systemctl --user start roku-browser")
@@ -168,6 +170,27 @@ def cmd_play(target):
     r = browser_service("/cast", body)
     print({"YouTube app": "Playing in the YouTube app.", "browser": "No direct video found; opened the page in Browser.",
            "player": "Playing on the TV."}.get(r.get("via"), r))
+
+
+def cmd_mirror(action="start"):
+    if action not in ("start", "stop"):
+        raise TypeError
+    if action == "stop":
+        r = browser_service("/mirror", {"on": False})
+        if not r.get("ok"):
+            sys.exit(r.get("error", r))
+        print("Stopped.")
+        return
+    print("Starting… (the first time, pick your screen in the window that opens)")
+    # Long enough for that first-time screen picker.
+    r = browser_service("/mirror", {"on": True}, timeout=180)
+    while r.get("pair"):
+        code = input("The TV is showing a code. Type it here: ").strip()
+        r = browser_service("/mirror", {"code": code}, timeout=180)
+    if not r.get("ok"):
+        sys.exit(r.get("error", r))
+    how = "over AirPlay" if r.get("via") == "airplay" else "in the Browser app, about 6 s behind"
+    print(f"Showing this screen on the TV {how}, with its sound. Stop with: roku mirror stop")
 
 
 def cmd_launch(name, content_id=None):
@@ -294,7 +317,8 @@ def cmd_remote():
         print()
 
 
-COMMANDS = {"key": cmd_key, "type": cmd_type, "browser": cmd_browser, "open": cmd_open, "play": cmd_play, "launch": cmd_launch,
+COMMANDS = {"key": cmd_key, "type": cmd_type, "browser": cmd_browser, "open": cmd_open, "play": cmd_play, "mirror": cmd_mirror,
+            "launch": cmd_launch,
             "apps": cmd_apps, "now": cmd_now, "info": cmd_info, "shot": cmd_shot, "sideload": cmd_sideload,
             "console": cmd_console, "find": cmd_find}
 
