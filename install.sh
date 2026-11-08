@@ -62,6 +62,7 @@ if ((${#missing[@]})); then
 fi
 command -v systemctl >/dev/null || fail "roku-browser runs as a systemd user service, and systemctl isn't available."
 echo "    python3, aiohttp, pillow, curl and $browser are all here."
+command -v ffmpeg >/dev/null || echo "    Optional: install ffmpeg too, for Dailymotion videos with sound."
 
 # ---- 2. find the Roku ------------------------------------------------------
 roku_ip="${ROKU_IP:-$(cfg_get roku)}"

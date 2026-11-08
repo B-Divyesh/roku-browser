@@ -1,33 +1,55 @@
 # Browser for Roku
 
-A real web browser on your Roku TV or stick, driven by the Roku remote.
+A web browser for your Roku TV or stick, driven by the Roku remote. It works two ways:
 
-Roku devices can't run a browser engine: apps are BrightScript only, with no web view
-and no native code. So this project splits the job:
+- **Full browser, with your Linux laptop.** A small service on the laptop (`roku-browser`)
+  runs a hidden Brave/Chromium, renders pages at the TV's resolution and streams them as
+  sharp frames. On the TV, the remote becomes a mouse: the cursor is drawn on the Roku, so it
+  moves instantly, and links light up as you pass over them. Every site works, as on a computer.
+- **Lite mode, on the Roku by itself.** When the laptop isn't around, the app fetches and
+  reads pages itself and lays them out natively: text, links, pictures, search boxes. The
+  remote moves between the things you can click. Sites that need JavaScript can't run here,
+  but news, reference, search and plenty more work, and YouTube and Dailymotion get native
+  pages built from their own data services.
 
-- **On your Linux laptop**, a small service (`roku-browser`) runs a hidden Brave/Chromium,
-  renders pages at the TV's resolution, and streams them as sharp JPEG frames.
-- **On the Roku**, the *Browser* app shows those frames and turns the remote into a
-  mouse. The cursor is drawn on the Roku itself, so it moves instantly, and it highlights
-  links and buttons as you pass over them. Clicks, scrolling and typing go back to the laptop.
-- **Videos play natively**: anything with a direct stream (HLS, DASH, MP4) plays in the
-  Roku's own player with sound, and YouTube links open the YouTube app.
+The app picks for you: full browser when the laptop answers, Lite mode after a few seconds
+if it doesn't, and you can switch from the menu at any time.
+
+| | Full browser (laptop) | Lite mode (Roku alone) |
+|---|---|---|
+| Websites | Every site, as on a computer | Sites that work without JavaScript: news, Wikipedia, search, forums, blogs |
+| YouTube | Browse youtube.com; videos open in the YouTube app | Search and results on the TV; videos open in the YouTube app |
+| Dailymotion | Plays on the TV with sound | Trending and search on the TV; plays with sound while the laptop is on, picture only without it |
+| Other videos | Videos found on a page play in the Roku's own player | `<video>` tags, embedded players and video links play in the Roku's own player |
+| Search | Brave Search | DuckDuckGo |
 
 Everything stays on your home network; nothing goes through a third-party server.
+
+**Full browser**
 
 | | |
 |---|---|
 | ![Start page](docs/start.jpg) | ![Link highlight and hover preview](docs/browsing.jpg) |
 | ![Menu](docs/menu.jpg) | ![Typing into a page](docs/keyboard.jpg) |
 
+**Lite mode**
+
+| | |
+|---|---|
+| ![Lite start page](docs/lite-start.jpg) | ![BBC News in Lite mode](docs/lite-news.jpg) |
+| ![YouTube search in Lite mode](docs/lite-youtube.jpg) | ![Dailymotion in Lite mode](docs/lite-dailymotion.jpg) |
+
 ## What you need
 
 - A Roku player or Roku TV with Roku OS 10 or newer (see step 1).
-- A Linux laptop or desktop with systemd, on **the same Wi-Fi** as the Roku. Some guest
-  networks stop devices from seeing each other; use one that doesn't.
-- On the laptop: Python 3.9+, `aiohttp`, Pillow, `curl`, and Brave, Chromium or Google Chrome.
-
-The laptop does the browsing, so it needs to be awake while you use the Browser app.
+- For the full browser: a Linux laptop or desktop with systemd, on **the same Wi-Fi** as the
+  Roku, with Python 3.9+, `aiohttp`, Pillow, `curl`, and Brave, Chromium or Google Chrome.
+  It does the browsing, so it needs to be awake while you use the full browser. Some guest
+  networks stop devices from seeing each other; use one that doesn't. Optional: `ffmpeg`,
+  for Dailymotion with sound.
+- **Lite mode only?** No laptop needed: do steps 1 to 4 below, then
+  [install the app by hand](#installing-the-roku-app-by-hand-optional) from any computer's web
+  browser (Windows, Mac, Linux or a phone).
 
 ## Setup from scratch
 
@@ -100,7 +122,7 @@ sudo apt install git python3 python3-aiohttp python3-pil curl chromium
 sudo dnf install git python3 python3-aiohttp python3-pillow curl chromium
 ```
 
-(If Brave or Google Chrome is already installed, you can skip `chromium`. On **Ubuntu**,
+Add `ffmpeg` to that list for Dailymotion with sound. (If Brave or Google Chrome is already installed, you can skip `chromium`. On **Ubuntu**,
 `chromium` comes as a snap, and snaps can't use the hidden folder the browser profile lives in.
 Install [Google Chrome](https://www.google.com/chrome/) or [Brave](https://brave.com/linux/)
 from their own packages instead.)
@@ -167,6 +189,9 @@ to see exactly what goes onto the Roku):
 
 The app appears at the end of the Roku home screen's app list as **Browser**.
 
+Without the laptop service it opens in Lite mode, which needs nothing else: this is the whole
+setup if you only want Lite mode.
+
 ## Using it
 
 | Remote button | Does |
@@ -180,6 +205,11 @@ The app appears at the end of the Roku home screen's app list as **Browser**.
 | Back | Go back; press twice on the first page to exit |
 
 The cursor fades out when you stop using the remote; any button brings it back.
+
+In **Lite mode** the same buttons apply, except that the arrows move between links, boxes and
+videos instead of a cursor: Up and Down go to the nearest one above or below (and scroll
+through text that has none), Left and Right go along a row. ✱ shows *Full browser (laptop)*
+whenever the laptop is reachable; in the full browser it offers *Lite mode*.
 
 From the laptop:
 
@@ -212,6 +242,13 @@ most video sites in the Roku's player.
   Roku apps (`roku launch iplayer`).
 - **The Browser app disappeared.** Turning developer mode off removes it. Turn it back on
   (step 4) and run `./install.sh` again. Developer mode allows one sideloaded app at a time.
+- **A page in Lite mode says it needs JavaScript**, or shows little. That site is built in
+  JavaScript, which Lite mode doesn't run: use the full browser, or another site.
+- **Dailymotion plays without sound** in Lite mode when the laptop is off: the Roku can't
+  decode the audio of Dailymotion's streams by itself. With the laptop service running (and
+  `ffmpeg` installed), the laptop repackages them and they play with sound.
+- **YouTube opens the YouTube app.** That's deliberate: it plays everything, at full quality,
+  with your account. Back on the remote returns to the Roku home screen.
 - Logs: `journalctl --user -u roku-browser -f` on the laptop, `roku console` for the Roku app.
 
 ## Privacy and security
@@ -241,6 +278,10 @@ channel/                 the Roku app (SceneGraph + BrightScript)
   components/BrowserScene  page frames (double-buffered), cursor, highlights, menu, keyboard, video
   components/PollTask      long-polls the laptop for new frames; finds it by broadcast
   components/CmdTask       sends clicks, scrolls and typing in order
+  components/lite/         Lite mode, which needs no laptop:
+    HtmlParser.brs           HTML to blocks (text with links, images, forms, videos), fast on a Roku
+    LiteTask.brs, Sites.brs  fetching on a background thread; YouTube and Dailymotion data services
+    LiteView                 native layout, focus movement, forms, history
   art/make_art.py          draws the icons, cursor and panels, and subsets the fonts
 bin/roku                 command-line remote, casting and developer tools
 install.sh, uninstall.sh

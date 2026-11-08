@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component name="LiteView" extends="Group">
+  <interface>
+    <!-- in: what to show and do -->
+    <field id="navigate" type="assocarray" alwaysNotify="true" onChange="onNavigate"/>
+    <field id="command" type="string" alwaysNotify="true" onChange="onCommand"/>
+    <field id="input" type="assocarray" alwaysNotify="true" onChange="onInput"/>
+    <field id="textScale" type="float" value="1.0" onChange="onTextScale"/>
+    <field id="holdOk" type="boolean" alwaysNotify="true" onChange="onHoldOk"/>
+    <!-- the laptop's roku-browser address when it's reachable, else "" -->
+    <field id="helper" type="string"/>
+    <!-- out: page state, and things only the scene can do (keyboard, video, other apps) -->
+    <field id="status" type="assocarray"/>
+    <field id="request" type="assocarray" alwaysNotify="true"/>
+  </interface>
+  <script type="text/brightscript" uri="LiteView.brs"/>
+  <script type="text/brightscript" uri="Url.brs"/>
+  <children>
+    <Rectangle width="1280" height="720" color="0x1A141BFF"/>
+    <Group id="content">
+      <Poster id="ring" uri="pkg:/images/ring.9.png" blendColor="0xE89B5EFF" visible="false"/>
+    </Group>
+    <Animation id="scrollAnim" duration="0.18" easeFunction="outCubic">
+      <Vector2DFieldInterpolator id="scrollInterp" key="[0, 1]" keyValue="[[0, 0], [0, 0]]" fieldToInterp="content.translation"/>
+    </Animation>
+    <Timer id="layoutTimer" repeat="true" duration="0.02"/>
+    <Timer id="repeatTimer" repeat="true" duration="0.4"/>
+  </children>
+</component>

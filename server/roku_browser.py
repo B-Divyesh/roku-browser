@@ -9,6 +9,7 @@ app), so they play smoothly with sound.
 import asyncio
 import base64
 import ctypes
+import hashlib
 import io
 import json
 import logging
@@ -21,7 +22,7 @@ import signal
 import socket
 import time
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -230,6 +231,17 @@ def youtube_id(url):
             return parse_qs(u.query).get("v", [None])[0]
         m = re.match(r"^/(?:shorts|live|embed)/([\w-]{6,})", u.path)
         return m and m.group(1)
+    return None
+
+
+def dailymotion_id(url):
+    u = urlparse(url)
+    host = (u.hostname or "").removeprefix("www.")
+    if host == "dai.ly":
+        return u.path.strip("/").split("/")[0] or None
+    if host.endswith("dailymotion.com"):
+        m = re.match(r"^/(?:embed/)?video/([a-z0-9]+)", u.path)
+        return m.group(1) if m else parse_qs(u.query).get("video", [None])[0]
     return None
 
 
@@ -854,6 +866,9 @@ class Browser:
         if vid:
             await self.ecp(f"launch/{YOUTUBE_APP}?contentId={quote(vid)}&mediaType=movie")
             return {"notice": "Opening in YouTube…"}
+        dm = dailymotion_id(info.get("url", ""))
+        if dm:
+            return await self.dailymotion_item(dm)
         streams = self.media.get(self.active)
         if streams:
             m = streams[0]
@@ -870,6 +885,47 @@ class Browser:
         if item:
             return {"play": item}
         return {"notice": "No playable video found on this page"}
+
+    async def dailymotion_item(self, video_id):
+        """A Dailymotion video as a stream the Roku plays with sound (remuxed here)."""
+        try:
+            async with self.http.get(f"https://www.dailymotion.com/player/metadata/video/{video_id}",
+                                     headers={"User-Agent": ROKU_UA},
+                                     timeout=aiohttp.ClientTimeout(total=15)) as r:
+                meta = await r.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return {"notice": "Dailymotion didn't answer. Try again in a moment."}
+        if meta.get("error"):
+            return {"notice": (meta["error"].get("title") if isinstance(meta["error"], dict) else None)
+                    or "This video can't be played here."}
+        master = ((meta.get("qualities") or {}).get("auto") or [{}])[0].get("url")
+        if not master:
+            return {"notice": "No playable stream for this video."}
+        variant = await self.best_variant(master)
+        if not shutil.which("ffmpeg"):
+            return {"play": {"url": variant, "format": "hls", "headers": [], "title": meta.get("title", "")},
+                    "notice": "No sound: install ffmpeg on the laptop for Dailymotion with sound."}
+        return {"play": {"url": f"{self.base_url()}/remux?u={quote(variant, safe='')}", "format": "hls",
+                         "headers": [], "title": meta.get("title", "")}}
+
+    async def best_variant(self, master):
+        """The highest quality up to 1080p from an HLS master playlist."""
+        try:
+            async with self.http.get(master, headers={"User-Agent": ROKU_UA},
+                                     timeout=aiohttp.ClientTimeout(total=15)) as r:
+                text = await r.text()
+                base = str(r.url)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return master
+        best, best_h = master, -1
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for i, line in enumerate(lines[:-1]):
+            if line.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"RESOLUTION=\d+x(\d+)", line)
+                h = int(m.group(1)) if m else 0
+                if best_h < h <= 1080:
+                    best, best_h = urljoin(base, lines[i + 1].split("#")[0]), h
+        return best
 
     async def ytdlp(self, url):
         exe = shutil.which("yt-dlp")
@@ -929,6 +985,55 @@ class Browser:
             pass
         self.roku_cache[ip] = (ok, time.monotonic())
         return ok
+
+
+# Dailymotion serves the Roku as itself; its CDN refuses a Roku that claims to be Chrome.
+ROKU_UA = "Roku/DVP-15.3"
+
+
+class Remuxer:
+    """Repackages a stream with ffmpeg (copying, not re-encoding) into HLS with TS segments.
+
+    Dailymotion (and others) mux audio and video into one fragmented-MP4 stream; a Roku
+    plays the picture from those but can't find the audio. In TS segments it can.
+    One stream at a time; the previous one is stopped and its files removed.
+    """
+
+    def __init__(self):
+        self.key = None
+        self.proc = None
+        self.dir = DATA / "remux"
+
+    async def start(self, url):
+        key = hashlib.sha1(url.encode()).hexdigest()[:12]
+        out = self.dir / key
+        alive = self.proc is not None and self.proc.returncode is None
+        if key != self.key or not (alive or (out / "index.m3u8").exists()):
+            if alive:
+                self.proc.kill()
+            shutil.rmtree(self.dir, ignore_errors=True)
+            out.mkdir(parents=True)
+            self.key = key
+            self.proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-loglevel", "error", "-user_agent", ROKU_UA, "-i", url,
+                "-sn", "-dn", "-c", "copy", "-f", "hls", "-hls_time", "4",
+                "-hls_list_size", "0", "-hls_playlist_type", "event",
+                "-hls_segment_filename", str(out / "seg%05d.ts"), str(out / "index.m3u8"),
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                preexec_fn=die_with_parent)
+            log.info("remuxing %s", url[:100])
+        index = out / "index.m3u8"
+        for _ in range(150):
+            if index.exists() and index.read_text().count("#EXTINF") >= 2:
+                return key
+            if self.proc.returncode not in (None, 0):
+                raise web.HTTPBadGateway(text="couldn't read that stream")
+            await asyncio.sleep(0.2)
+        raise web.HTTPGatewayTimeout(text="the stream took too long to start")
+
+    def stop(self):
+        if self.proc is not None and self.proc.returncode is None:
+            self.proc.kill()
 
 
 class Discovery(asyncio.DatagramProtocol):
@@ -1029,6 +1134,13 @@ def make_app(b):
             if vid:
                 await b.ecp(f"launch/{YOUTUBE_APP}?contentId={quote(vid)}&mediaType=movie")
                 return web.json_response({"ok": True, "via": "YouTube app"})
+            dm = dailymotion_id(url)
+            if dm:
+                r = await b.dailymotion_item(dm)
+                if "notice" in r:
+                    return web.json_response({"ok": False, "error": r["notice"]})
+                await b.show_on_tv({"play": r["play"]})
+                return web.json_response({"ok": True, "via": "player", "item": r["play"]})
             fmt = format_for(url)
             item = ({"url": url, "format": fmt, "headers": [], "title": Path(urlparse(url).path).name}
                     if fmt else await b.ytdlp(url))
@@ -1040,17 +1152,43 @@ def make_app(b):
         await b.show_on_tv({"play": item})
         return web.json_response({"ok": True, "via": "player", "item": item})
 
+    async def dailymotion(req):
+        """For Lite mode: one link that ends at a Dailymotion stream with sound."""
+        r = await b.dailymotion_item(req.match_info["id"])
+        if "play" not in r:
+            raise web.HTTPBadGateway(text=r.get("notice", ""))
+        raise web.HTTPFound(r["play"]["url"])
+
+    async def remux(req):
+        url = req.query.get("u", "")
+        if not url.startswith("http"):
+            raise web.HTTPBadRequest()
+        key = await remuxer.start(url)
+        raise web.HTTPFound(f"/remux/{key}/index.m3u8")
+
+    async def remux_file(req):
+        key, name = req.match_info["key"], req.match_info["name"]
+        path = remuxer.dir / key / name
+        if key != remuxer.key or "/" in name or not path.is_file():
+            raise web.HTTPNotFound()
+        kind = "application/vnd.apple.mpegurl" if name.endswith(".m3u8") else "video/mp2t"
+        return web.FileResponse(path, headers={"Content-Type": kind, "Cache-Control": "no-store"})
+
     async def file(req):
         p = b.files.get(req.match_info["token"])
         if not p:
             raise web.HTTPNotFound()
         return web.FileResponse(p, headers={"Content-Type": mimetypes.guess_type(p.name)[0] or "video/mp4"})
 
+    remuxer = Remuxer()
+    b.remuxer = remuxer
     app = web.Application(middlewares=[guard])
     app.add_routes([
         web.get("/hello", hello), web.get("/start", start), web.get("/poll", poll), web.get(r"/frame/{n}.jpg", frame),
         web.get("/input", input_), web.get("/state", state), web.post("/open", open_),
         web.post("/type", type_), web.post("/cast", cast), web.get("/file/{token}/{name}", file),
+        web.get("/remux", remux), web.get("/remux/{key}/{name}", remux_file),
+        web.get("/dailymotion/{id}", dailymotion),
     ])
     return app
 
@@ -1092,6 +1230,7 @@ async def main():
         loop.add_signal_handler(sig, done.set)
     await done.wait()
     dog.cancel()
+    b.remuxer.stop()
     await b.stop()
     await b.http.close()
     await runner.cleanup()

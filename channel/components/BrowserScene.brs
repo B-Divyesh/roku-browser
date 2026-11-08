@@ -48,6 +48,11 @@ sub init()
     m.idleTimer.observeField("fire", "onIdle")
     m.menuList.observeField("itemSelected", "onMenuSelect")
     m.video.observeField("state", "onVideoState")
+    m.lite = m.top.findNode("lite")
+    m.lite.observeField("request", "onLiteRequest")
+    m.lite.observeField("status", "onLiteStatus")
+    m.top.findNode("fallbackTimer").observeField("fire", "onFallback")
+    m.top.findNode("lostTimer").observeField("fire", "onLost")
 
     ' Ember colours for the system keyboard dialog.
     palette = CreateObject("roSGNode", "RSGPalette")
@@ -93,6 +98,13 @@ sub init()
     m.hover = invalid
     m.cursorShown = true
     m.revealed = false
+    ' "connecting" until the laptop answers; "full" with it, "lite" without.
+    m.mode = "connecting"
+    m.ignoreOkUntil = 0
+    m.laptopAvailable = false
+    m.toldLaptop = false
+    m.liteScale = 1.0
+    m.kbField = -1
     placeCursor()
 
     m.poll = CreateObject("roSGNode", "PollTask")
@@ -117,13 +129,115 @@ sub onLaunchArgs()
     m.cmd.server = server
     m.poll.control = "RUN"
     m.cmd.control = "RUN"
+    if args <> invalid and args.mode = "lite"
+        enterLite("")
+    else
+        m.top.findNode("fallbackTimer").control = "start"
+    end if
+end sub
+
+sub onFallback()
+    if m.mode = "connecting" then enterLite("No laptop found, so this is Lite mode")
+end sub
+
+sub onLost()
+    if m.mode = "full" and not m.online then enterLite("Lost the laptop, so this is Lite mode")
+end sub
+
+sub enterLite(message as string)
+    m.mode = "lite"
+    m.poll.active = false
+    m.top.findNode("fallbackTimer").control = "stop"
+    m.anim.offlineOut.control = "stop"
+    m.offline.opacity = 0
+    m.spinner.control = "stop"
+    m.front.visible = false
+    m.back.visible = false
+    m.cursor.visible = false
+    m.highlight.visible = false
+    m.lite.visible = true
+    if m.pendingOpen <> invalid
+        m.lite.navigate = {url: m.pendingOpen}
+        m.pendingOpen = invalid
+    else if m.lite.status = invalid
+        m.lite.navigate = {url: "lite:start"}
+    end if
+    m.lite.setFocus(true)
+    if message <> "" then showNotice(message)
+    if not m.hintsChecked then hintsOnLaunch()
+end sub
+
+sub enterFull()
+    m.mode = "full"
+    m.poll.active = true
+    m.top.findNode("fallbackTimer").control = "stop"
+    m.lite.visible = false
+    m.front.visible = true
+    m.back.visible = true
+    m.cursor.visible = true
+    m.hover = invalid
+    placeCursor()
+    m.top.setFocus(true)
+    if not m.online
+        m.offline.opacity = 1
+        m.spinner.control = "start"
+    end if
+end sub
+
+' Back on the scene, menu or keyboard: focus goes to whichever mode is showing.
+sub restoreFocus()
+    if m.mode = "lite"
+        m.lite.setFocus(true)
+    else
+        m.top.setFocus(true)
+    end if
+end sub
+
+sub onLiteRequest()
+    r = m.lite.request
+    if r = invalid then return
+    if r.keyboard <> invalid
+        k = r.keyboard
+        m.kbField = k.field
+        buttons = ["Go", "Done", "Cancel"]
+        if k.kind = "textarea" then buttons = ["Done", "Cancel"]
+        showKeyboard("lite", k.title, k.value, k.kind, buttons)
+    else if r.play <> invalid
+        playVideo(r.play)
+        if r.notice <> invalid then showNotice(r.notice)
+    else if r.launch <> invalid
+        showNotice("Opening the app…")
+        m.top.launchApp = r.launch
+    else if r.notice <> invalid
+        showNotice(r.notice)
+    else if r.exitAsk = true
+        askExit()
+    end if
+end sub
+
+sub onLiteStatus()
+    s = m.lite.status
+    if s = invalid then return
+    label = s.title
+    if s.host <> "" and label <> "" then label = label + "  " + Chr(183) + "  " + s.host
+    if label = "" then label = s.host
+    if label = "" and s.loading = true then label = "Loading" + Chr(8230)
+    updateChrome({url: s.url, label: label, loading: s.loading})
 end sub
 
 sub onInputArgs()
     args = m.top.inputArgs
     if args = invalid then return
     if args.server <> invalid and args.server <> "" then m.poll.server = args.server
-    if args.url <> invalid and args.url <> "" then send("nav", {q: args.url})
+    if args.mode = "lite" and m.mode <> "lite" then enterLite("")
+    if args.mode = "full" and m.mode <> "full" then enterFull()
+    if args.url <> invalid and args.url <> ""
+        if m.mode = "lite"
+            m.lite.navigate = {url: args.url}
+        else
+            send("nav", {q: args.url})
+        end if
+    end if
 end sub
 
 sub onServer()
@@ -139,7 +253,19 @@ sub onOnline()
     online = m.poll.online
     if online = m.online then return
     m.online = online
+    m.laptopAvailable = online
+    ' Lite mode borrows the laptop for what the Roku can't do alone (Dailymotion sound).
+    if online then m.lite.helper = m.server else m.lite.helper = ""
+    if m.mode = "lite"
+        if online and not m.toldLaptop
+            m.toldLaptop = true
+            showNotice("Your laptop is available: " + Chr(10033) + " menu " + Chr(8250) + " Full browser")
+        end if
+        return
+    end if
     if online
+        m.top.findNode("lostTimer").control = "stop"
+        if m.mode = "connecting" then enterFull()
         m.anim.offlineOut.control = "start"
         m.spinner.control = "stop"
         if m.pendingOpen <> invalid
@@ -151,6 +277,7 @@ sub onOnline()
         m.anim.offlineOut.control = "stop"
         m.offline.opacity = 1
         m.spinner.control = "start"
+        m.top.findNode("lostTimer").control = "start"
     end if
 end sub
 
@@ -222,6 +349,23 @@ function onKeyEvent(key as string, press as boolean) as boolean
         if press and (key = "back" or key = "options") then closeMenu()
         return true
     end if
+    if m.mode = "lite"
+        ' Lite view handles moving and clicking; these are what it passes up.
+        if not press then return false
+        hideHints()
+        if key = "options"
+            openMenu()
+        else if key = "play"
+            openAddress()
+        else if key = "replay"
+            m.lite.command = "reload"
+        else if key = "back"
+            askExit()
+        else
+            return false
+        end if
+        return true
+    end if
     if press then wake()
     if key = "up" or key = "down" or key = "left" or key = "right"
         if press
@@ -235,7 +379,7 @@ function onKeyEvent(key as string, press as boolean) as boolean
     if not press then return true
     hideHints()
     if key = "OK"
-        if m.revealed then return true
+        if m.revealed or m.clock.TotalMilliseconds() < m.ignoreOkUntil then return true
         click()
     else if key = "back"
         goBack()
@@ -391,6 +535,10 @@ sub goBack()
         send("back")
         return
     end if
+    askExit()
+end sub
+
+sub askExit()
     now = m.clock.TotalMilliseconds()
     if now - m.backArmed < 2500
         m.top.exitApp = true
@@ -472,7 +620,15 @@ sub onKeyboardButton()
     text = kb.text
     kb.close = true
     if m.kbMode = "address"
-        if choice = "Go" and text.trim() <> "" then send("nav", {q: text})
+        if choice = "Go" and text.trim() <> ""
+            if m.mode = "lite"
+                m.lite.input = {field: -1, text: text, submit: true, address: true}
+            else
+                send("nav", {q: text})
+            end if
+        end if
+    else if m.kbMode = "lite"
+        if choice <> "Cancel" then m.lite.input = {field: m.kbField, text: text, submit: choice = "Go"}
     else if choice = "Enter"
         send("text", {s: text, enter: 1})
     else if choice = "Done"
@@ -481,12 +637,16 @@ sub onKeyboardButton()
 end sub
 
 sub onKeyboardClosed()
-    m.top.setFocus(true)
+    restoreFocus()
 end sub
 
 ' ---- menu ---------------------------------------------------------------
 
 sub openMenu(focusId = "" as string)
+    if m.mode = "lite"
+        openLiteMenu(focusId)
+        return
+    end if
     s = m.state
     items = [{id: "address", title: "Search or enter address", value: ""}]
     if s.video <> invalid and s.video <> "" then items.push({id: "video", title: s.video, value: ""})
@@ -495,9 +655,33 @@ sub openMenu(focusId = "" as string)
     items.push({id: "zoom", title: "Text size", value: s.zoom.toStr() + "%"})
     items.push({id: "home", title: "Start page", value: ""})
     if s.tabs > 1 then items.push({id: "closetab", title: "Close tab", value: s.tabs.toStr() + " open"})
+    items.push({id: "lite", title: "Lite mode (no laptop)", value: ""})
     items.push({id: "help", title: "Remote buttons", value: ""})
     items.push({id: "exit", title: "Exit Browser", value: ""})
+    title = "Browser"
+    if s.title <> invalid and s.title <> "" then title = s.title
+    showMenu(items, focusId, title, s.host)
+end sub
 
+sub openLiteMenu(focusId as string)
+    s = m.lite.status
+    items = [{id: "address", title: "Search or enter address", value: ""}]
+    items.push({id: "reload", title: "Reload", value: ""})
+    items.push({id: "zoom", title: "Text size", value: Int(m.liteScale * 100 + 0.5).toStr() + "%"})
+    items.push({id: "home", title: "Start page", value: ""})
+    if m.laptopAvailable then items.push({id: "full", title: "Full browser (laptop)", value: ""})
+    items.push({id: "help", title: "Remote buttons", value: ""})
+    items.push({id: "exit", title: "Exit Browser", value: ""})
+    title = "Lite mode"
+    host = ""
+    if s <> invalid
+        if s.title <> "" then title = s.title
+        host = s.host
+    end if
+    showMenu(items, focusId, title, host)
+end sub
+
+sub showMenu(items as object, focusId as string, title as string, subtitle as string)
     content = CreateObject("roSGNode", "ContentNode")
     focus = 0
     for i = 0 to items.count() - 1
@@ -510,11 +694,8 @@ sub openMenu(focusId = "" as string)
     m.menuList.numRows = items.count()
     m.menuList.content = content
     m.menuList.jumpToItem = focus
-
-    title = "Browser"
-    if s.title <> invalid and s.title <> "" then title = s.title
     m.menuTitle.text = title
-    m.menuSub.text = s.host
+    m.menuSub.text = subtitle
 
     listH = items.count() * 56 - 4
     cardH = 112 + listH + 24
@@ -532,15 +713,24 @@ end sub
 
 sub closeMenu()
     m.menuList.setFocus(false)
-    m.top.setFocus(true)
     m.menu.visible = false
-    m.cursor.visible = true
-    m.hover = invalid
-    placeCursor()
+    ' The OK that picked a menu item can arrive again once focus moves; don't click with it.
+    m.ignoreOkUntil = m.clock.TotalMilliseconds() + 500
+    if m.mode = "lite" then m.lite.holdOk = true
+    restoreFocus()
+    if m.mode <> "lite"
+        m.cursor.visible = true
+        m.hover = invalid
+        placeCursor()
+    end if
 end sub
 
 sub onMenuSelect()
     id = m.menuItems[m.menuList.itemSelected].id
+    if m.mode = "lite"
+        onLiteMenuSelect(id)
+        return
+    end if
     if id = "zoom"
         ' Cycle in place so the size can be stepped through without reopening.
         sizes = [100, 125, 150, 175]
@@ -561,6 +751,34 @@ sub onMenuSelect()
         send("video", invalid, 50000)
     else if id = "forward" or id = "reload" or id = "home" or id = "closetab"
         send(id)
+    else if id = "help"
+        showHints()
+    else if id = "lite"
+        enterLite("")
+    else if id = "exit"
+        m.top.exitApp = true
+    end if
+end sub
+
+sub onLiteMenuSelect(id as string)
+    if id = "zoom"
+        scales = [1.0, 1.15, 1.3]
+        nxt = 1.0
+        for i = 0 to scales.count() - 1
+            if Abs(scales[i] - m.liteScale) < 0.01 then nxt = scales[(i + 1) mod scales.count()]
+        end for
+        m.liteScale = nxt
+        m.lite.textScale = nxt
+        openLiteMenu("zoom")
+        return
+    end if
+    closeMenu()
+    if id = "address"
+        openAddress()
+    else if id = "reload" or id = "home"
+        m.lite.command = id
+    else if id = "full"
+        enterFull()
     else if id = "help"
         showHints()
     else if id = "exit"
@@ -588,10 +806,12 @@ end sub
 sub stopVideo()
     m.video.control = "stop"
     m.video.visible = false
-    m.cursor.visible = true
-    m.hover = invalid
-    placeCursor()
-    m.top.setFocus(true)
+    if m.mode <> "lite"
+        m.cursor.visible = true
+        m.hover = invalid
+        placeCursor()
+    end if
+    restoreFocus()
 end sub
 
 sub onVideoState()
@@ -662,6 +882,10 @@ sub showNotice(text as string)
     hideHints()
     m.anim.noticeOut.control = "stop"
     if m.notice.opacity < 1 then m.anim.noticeIn.control = "start"
+    ' Long messages stay up long enough to read.
+    seconds = Len(text) / 16
+    if seconds < 3.5 then seconds = 3.5
+    m.noticeTimer.duration = seconds
     m.noticeTimer.control = "stop"
     m.noticeTimer.control = "start"
 end sub

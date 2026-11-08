@@ -4,6 +4,7 @@
     <field id="server" type="string"/>
     <field id="update" type="assocarray"/>
     <field id="online" type="boolean" value="false"/>
+    <field id="active" type="boolean" value="true"/>
   </interface>
   <script type="text/brightscript" uri="PollTask.brs"/>
 </component>

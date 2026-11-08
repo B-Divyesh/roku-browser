@@ -4,6 +4,7 @@
     <field id="launchArgs" type="assocarray" onChange="onLaunchArgs"/>
     <field id="inputArgs" type="assocarray" onChange="onInputArgs"/>
     <field id="exitApp" type="boolean" alwaysNotify="true"/>
+    <field id="launchApp" type="assocarray" alwaysNotify="true"/>
   </interface>
   <script type="text/brightscript" uri="BrowserScene.brs"/>
   <children>
@@ -12,6 +13,9 @@
     <!-- Two page layers: the next frame loads into the hidden one, then they swap. -->
     <Poster id="pageA" width="1280" height="720" opacity="0"/>
     <Poster id="pageB" width="1280" height="720" opacity="0"/>
+
+    <!-- Lite mode: pages fetched and drawn by the Roku itself, when there's no laptop. -->
+    <LiteView id="lite" visible="false"/>
 
     <Rectangle id="progress" width="260" height="3" translation="[-260, 0]" color="0xE89B5EFF" visible="false"/>
 
@@ -25,14 +29,6 @@
       <Poster id="toastEdge" uri="pkg:/images/pill_edge.9.png" blendColor="0x54444FFF" height="46"/>
       <Label id="toastLabel" translation="[24, 0]" height="46" vertAlign="center" color="0xF0E4D4FF">
         <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="19"/>
-      </Label>
-    </Group>
-
-    <Group id="notice" opacity="0">
-      <Poster id="noticeBg" uri="pkg:/images/pill.9.png" blendColor="0x2B222BFF" opacity="1" height="50"/>
-      <Poster id="noticeEdge" uri="pkg:/images/pill_edge.9.png" blendColor="0x54444FFF" height="50"/>
-      <Label id="noticeLabel" translation="[26, 0]" height="50" vertAlign="center" color="0xF0E4D4FF">
-        <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="20"/>
       </Label>
     </Group>
 
@@ -60,18 +56,30 @@
       </Label>
       <Label id="offlineText" width="760" translation="[260, 384]" horizAlign="center" wrap="true"
              color="0xB5A698FF"
-             text="Pages are drawn by roku-browser on your laptop. Keep it awake and on the same Wi-Fi, and this screen will connect by itself.">
+             text="Full websites come from roku-browser on your laptop. If it isn't found in a few seconds, Lite mode opens instead and runs on the Roku by itself.">
         <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="21"/>
       </Label>
     </Group>
 
     <Video id="video" width="1280" height="720" visible="false"/>
 
+    <!-- Notices sit above the video so messages about playback are seen. -->
+    <Group id="notice" opacity="0">
+      <Poster id="noticeBg" uri="pkg:/images/pill.9.png" blendColor="0x2B222BFF" opacity="1" height="50"/>
+      <Poster id="noticeEdge" uri="pkg:/images/pill_edge.9.png" blendColor="0x54444FFF" height="50"/>
+      <Label id="noticeLabel" translation="[26, 0]" height="50" vertAlign="center" color="0xF0E4D4FF">
+        <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="20"/>
+      </Label>
+    </Group>
+
+
     <Timer id="moveTimer" repeat="true" duration="0.033"/>
     <Timer id="toastTimer" duration="2.5"/>
     <Timer id="noticeTimer" duration="3.5"/>
     <Timer id="hintsTimer" duration="9"/>
     <Timer id="idleTimer" duration="6"/>
+    <Timer id="fallbackTimer" duration="5"/>
+    <Timer id="lostTimer" duration="6"/>
 
     <Animation id="toastIn" duration="0.2" easeFunction="outQuad">
       <FloatFieldInterpolator key="[0, 1]" keyValue="[0, 1]" fieldToInterp="toast.opacity"/>

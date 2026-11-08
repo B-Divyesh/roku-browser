@@ -10,6 +10,8 @@ sub work()
     sv = -1
     failures = 0
     uiWidth = CreateObject("roDeviceInfo").GetUIResolution().width
+    port = CreateObject("roMessagePort")
+    m.top.observeField("active", port)
     while true
         server = m.top.server
         if server = "" or failures >= 2
@@ -25,7 +27,17 @@ sub work()
 
         if server = ""
             m.top.online = false
-            sleep(1500)
+            wait(3000, port)
+        else if not m.top.active
+            ' Lite mode: only notice the laptop coming and going, without waking its browser.
+            if fetch(server + "/hello", 3000) <> invalid
+                failures = 0
+                m.top.online = true
+            else
+                failures = failures + 1
+                if failures >= 2 then m.top.online = false
+            end if
+            wait(8000, port)
         else
             body = fetch(server + "/poll?since=" + since.toStr() + "&sv=" + sv.toStr() + "&w=" + uiWidth.toStr(), 15000)
             data = invalid
