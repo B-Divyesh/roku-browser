@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component name="CmdTask" extends="Task">
+  <interface>
+    <field id="server" type="string"/>
+    <field id="cmd" type="assocarray" alwaysNotify="true"/>
+    <field id="result" type="assocarray" alwaysNotify="true"/>
+  </interface>
+  <script type="text/brightscript" uri="CmdTask.brs"/>
+</component>

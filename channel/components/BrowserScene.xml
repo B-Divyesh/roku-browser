@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component name="BrowserScene" extends="Scene">
+  <interface>
+    <field id="launchArgs" type="assocarray" onChange="onLaunchArgs"/>
+    <field id="inputArgs" type="assocarray" onChange="onInputArgs"/>
+    <field id="exitApp" type="boolean" alwaysNotify="true"/>
+  </interface>
+  <script type="text/brightscript" uri="BrowserScene.brs"/>
+  <children>
+    <Rectangle id="bg" width="1280" height="720" color="0x1A141BFF"/>
+
+    <!-- Two page layers: the next frame loads into the hidden one, then they swap. -->
+    <Poster id="pageA" width="1280" height="720" opacity="0"/>
+    <Poster id="pageB" width="1280" height="720" opacity="0"/>
+
+    <Rectangle id="progress" width="260" height="3" translation="[-260, 0]" color="0xE89B5EFF" visible="false"/>
+
+    <Poster id="ring" uri="pkg:/images/ring.png" width="96" height="96" scaleRotateCenter="[48, 48]"
+            blendColor="0xE89B5EFF" opacity="0"/>
+    <Poster id="highlight" uri="pkg:/images/ring.9.png" blendColor="0xE89B5EFF" opacity="0.95" visible="false"/>
+    <Poster id="cursor" uri="pkg:/images/cursor.png" width="40" height="40"/>
+
+    <Group id="toast" opacity="0">
+      <Poster id="toastBg" uri="pkg:/images/pill.9.png" blendColor="0x1A141BFF" opacity="0.94" height="46"/>
+      <Label id="toastLabel" translation="[24, 0]" height="46" vertAlign="center" color="0xF0E4D4FF">
+        <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="19"/>
+      </Label>
+    </Group>
+
+    <Group id="notice" opacity="0">
+      <Poster id="noticeBg" uri="pkg:/images/pill.9.png" blendColor="0x1A141BFF" opacity="0.94" height="50"/>
+      <Label id="noticeLabel" translation="[26, 0]" height="50" vertAlign="center" color="0xF0E4D4FF">
+        <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="20"/>
+      </Label>
+    </Group>
+
+    <Poster id="hints" uri="pkg:/images/hints.png" width="1095" height="56" translation="[92, 636]" opacity="0"/>
+
+    <Group id="menu" visible="false">
+      <Rectangle width="1280" height="720" color="0x000000FF" opacity="0.5"/>
+      <Poster id="menuCard" uri="pkg:/images/card.9.png" blendColor="0x1A141BFF" opacity="0.97" width="520"/>
+      <Label id="menuTitle" width="472" color="0xF0E4D4FF">
+        <Font role="font" uri="pkg:/fonts/Inter-SemiBold.ttf" size="24"/>
+      </Label>
+      <Label id="menuSub" width="472" color="0xB5A698FF">
+        <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="17"/>
+      </Label>
+      <MarkupList id="menuList" itemComponentName="MenuItem" itemSize="[472, 52]" itemSpacing="[0, 4]"
+                  drawFocusFeedback="false" vertFocusAnimationStyle="floatingFocus"/>
+    </Group>
+
+    <Group id="offline">
+      <Rectangle width="1280" height="720" color="0x1A141BFF"/>
+      <BusySpinner id="spinner" translation="[608, 236]" spinInterval="1.0"/>
+      <Label id="offlineTitle" text="Looking for your laptop" width="1280" horizAlign="center"
+             translation="[0, 330]" color="0xF0E4D4FF">
+        <Font role="font" uri="pkg:/fonts/Inter-SemiBold.ttf" size="32"/>
+      </Label>
+      <Label id="offlineText" width="760" translation="[260, 384]" horizAlign="center" wrap="true"
+             color="0xB5A698FF"
+             text="Pages are drawn by roku-browser on your laptop. Keep it awake and on the same Wi-Fi, and this screen will connect by itself.">
+        <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="21"/>
+      </Label>
+    </Group>
+
+    <Video id="video" width="1280" height="720" visible="false"/>
+
+    <Timer id="moveTimer" repeat="true" duration="0.033"/>
+    <Timer id="toastTimer" duration="2.5"/>
+    <Timer id="noticeTimer" duration="3.5"/>
+    <Timer id="hintsTimer" duration="9"/>
+    <Timer id="idleTimer" duration="6"/>
+
+    <Animation id="toastIn" duration="0.2" easeFunction="outQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[0, 1]" fieldToInterp="toast.opacity"/>
+    </Animation>
+    <Animation id="toastOut" duration="0.45" easeFunction="inQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[1, 0]" fieldToInterp="toast.opacity"/>
+    </Animation>
+    <Animation id="noticeIn" duration="0.2" easeFunction="outQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[0, 1]" fieldToInterp="notice.opacity"/>
+    </Animation>
+    <Animation id="noticeOut" duration="0.45" easeFunction="inQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[1, 0]" fieldToInterp="notice.opacity"/>
+    </Animation>
+    <Animation id="hintsIn" duration="0.3" easeFunction="outQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[0, 1]" fieldToInterp="hints.opacity"/>
+    </Animation>
+    <Animation id="hintsOut" duration="0.45" easeFunction="inQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[1, 0]" fieldToInterp="hints.opacity"/>
+    </Animation>
+    <Animation id="offlineOut" duration="0.35" easeFunction="inQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[1, 0]" fieldToInterp="offline.opacity"/>
+    </Animation>
+    <Animation id="cursorOut" duration="0.4" easeFunction="inQuad">
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[1, 0]" fieldToInterp="cursor.opacity"/>
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[0.95, 0]" fieldToInterp="highlight.opacity"/>
+    </Animation>
+    <Animation id="clickAnim" duration="0.35" easeFunction="outCubic">
+      <Vector2DFieldInterpolator key="[0, 1]" keyValue="[[0.25, 0.25], [1, 1]]" fieldToInterp="ring.scale"/>
+      <FloatFieldInterpolator key="[0, 1]" keyValue="[0.9, 0]" fieldToInterp="ring.opacity"/>
+    </Animation>
+    <Animation id="progressAnim" duration="1.1" repeat="true" easeFunction="inOutQuad">
+      <Vector2DFieldInterpolator key="[0, 1]" keyValue="[[-260, 0], [1280, 0]]" fieldToInterp="progress.translation"/>
+    </Animation>
+  </children>
+</component>

@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""roku: control the Roku from the terminal.
+
+  roku                     remote: arrows, Enter=OK, Backspace=Back, h=Home, space=Play/Pause,
+                           , . = rewind/forward, * = options, + - m = volume, / = type text, q = quit
+  roku key KEY...          press buttons (Home Back Select Up Down Left Right Play Rev Fwd
+                           InstantReplay Info Search VolumeUp VolumeDown VolumeMute PowerOff)
+  roku type TEXT           type into the Browser page if it's open, else the on-screen keyboard
+  roku browser             open the Browser app on the TV, connected to this laptop
+  roku open URL|SEARCH     show a web page in the Browser app
+  roku play URL|FILE       play a video on the TV (YouTube links open the YouTube app)
+  roku launch APP [ID]     open an app by name or id, optionally straight to a video/show id
+  roku apps                list installed apps
+  roku now                 what's on screen and what's playing
+  roku info                device details
+  roku shot [FILE]         screenshot (works while the Browser app is on screen)
+  roku sideload [ZIP]      install a dev channel (default: build and install Browser)
+  roku console             follow the dev channel's debug output
+  roku find                find Rokus on the network and remember the first
+"""
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+import zipfile
+from pathlib import Path
+
+CONFIG = Path.home() / ".config/roku/config.json"
+CHANNEL = Path(__file__).resolve().parent.parent / "channel"
+SERVER = "http://127.0.0.1:8765"
+BROWSER_FILES = ["manifest", "source", "components", "images", "fonts"]
+
+
+def config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def save_config(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+    CONFIG.chmod(0o600)
+
+
+def discover(timeout=3):
+    msg = b'M-SEARCH * HTTP/1.1\r\nHost: 239.255.255.250:1900\r\nMan: "ssdp:discover"\r\nST: roku:ecp\r\nMX: 2\r\n\r\n'
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    s.sendto(msg, ("239.255.255.250", 1900))
+    found = []
+    end = time.time() + timeout
+    try:
+        while time.time() < end:
+            data, addr = s.recvfrom(4096)
+            if b"roku:ecp" in data and addr[0] not in found:
+                found.append(addr[0])
+    except socket.timeout:
+        pass
+    return found
+
+
+def roku_ip():
+    cfg = config()
+    if cfg.get("roku"):
+        return cfg["roku"]
+    found = discover()
+    if not found:
+        sys.exit("No Roku found on this network.")
+    cfg["roku"] = found[0]
+    save_config(cfg)
+    return found[0]
+
+
+def ecp(path, method="POST", timeout=5):
+    req = urllib.request.Request(f"http://{roku_ip()}:8060/{path}", method=method,
+                                 data=b"" if method == "POST" else None)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            sys.exit("The Roku refused that. Set Settings > System > Advanced system settings > "
+                     "Control by mobile apps > Network access to Enabled or Permissive.")
+        raise
+
+
+def tag(xml, name):
+    m = re.search(rf"<{name}>([^<]*)</{name}>", xml)
+    return m.group(1) if m else ""
+
+
+def apps():
+    xml = ecp("query/apps", "GET")
+    return re.findall(r'<app id="([^"]+)"[^>]*>([^<]+)</app>', xml)
+
+
+def active_app():
+    m = re.search(r'<app id="([^"]+)"[^>]*>([^<]+)</app>', ecp("query/active-app", "GET"))
+    return m.groups() if m else ("", "Home")
+
+
+def browser_service(path, body):
+    req = urllib.request.Request(SERVER + path, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read())
+    except urllib.error.URLError as e:
+        sys.exit(f"roku-browser isn't running ({e.reason}). Start it: systemctl --user start roku-browser")
+
+
+def dev_curl(*args):
+    """curl against the Roku's developer web server; the password goes in on stdin, not argv."""
+    cfg = config()
+    user, password = cfg.get("dev_user", "rokudev"), cfg.get("dev_password")
+    if not password:
+        sys.exit(f'Add "dev_password" (the developer-mode web server password) to {CONFIG}')
+    login = f'user = "{user}:{password}"\n'.encode()
+    return subprocess.run(["curl", "-s", "-m", "90", "--digest", "-K", "-", *args],
+                          input=login, capture_output=True, check=True).stdout
+
+
+def local_ip():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect((roku_ip(), 8060))
+        return s.getsockname()[0]
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_key(*keys):
+    for k in keys:
+        ecp(f"keypress/{urllib.parse.quote(k)}")
+        time.sleep(0.12)
+
+
+def cmd_type(*words):
+    text = " ".join(words)
+    if active_app()[0] == "dev":
+        browser_service("/type", {"text": text})
+        return
+    for ch in text:
+        ecp("keypress/Lit_" + urllib.parse.quote(ch, safe=""))
+
+
+def cmd_browser():
+    server = f"http://{local_ip()}:8765"
+    ecp(f"launch/dev?server={urllib.parse.quote(server, safe='')}")
+    print("Opened Browser on the TV.")
+
+
+def cmd_open(*words):
+    browser_service("/open", {"q": " ".join(words)})
+    print("Opening on the TV.")
+
+
+def cmd_play(target):
+    path = Path(target).expanduser()
+    body = {"path": str(path.resolve())} if path.exists() else {"url": target}
+    r = browser_service("/cast", body)
+    print({"YouTube app": "Playing in the YouTube app.", "browser": "No direct video found; opened the page in Browser.",
+           "player": "Playing on the TV."}.get(r.get("via"), r))
+
+
+def cmd_launch(name, content_id=None):
+    match = [(i, n) for i, n in apps() if name.lower() in (i.lower(), n.lower())] or \
+            [(i, n) for i, n in apps() if name.lower() in n.lower()]
+    if not match:
+        sys.exit(f"No app matching {name!r}. Try: roku apps")
+    app_id, app_name = match[0]
+    query = f"?contentId={urllib.parse.quote(content_id)}&mediaType=movie" if content_id else ""
+    ecp(f"launch/{app_id}{query}")
+    print(f"Opened {app_name}.")
+
+
+def cmd_apps():
+    for app_id, name in sorted(apps(), key=lambda a: a[1].lower()):
+        print(f"{app_id:>8}  {name}")
+
+
+def cmd_now():
+    app_id, name = active_app()
+    print(f"On screen: {name} ({app_id})")
+    mp = ecp("query/media-player", "GET")
+    state = re.search(r'<player [^>]*state="([^"]+)"', mp)
+    if state and state.group(1) not in ("close", "none"):
+        pos, dur = tag(mp, "position"), tag(mp, "duration")
+        print(f"Player: {state.group(1)}  {pos} / {dur}")
+
+
+def cmd_info():
+    xml = ecp("query/device-info", "GET")
+    for key in ["friendly-device-name", "model-name", "model-number", "software-version", "network-type",
+                "network-name", "ecp-setting-mode", "developer-enabled", "supports-airplay", "ui-resolution"]:
+        print(f"{key:>22}: {tag(xml, key)}")
+    print(f"{'ip':>22}: {roku_ip()}")
+
+
+def cmd_shot(out=None):
+    html = dev_curl("-F", "mysubmit=Screenshot", "-F", "passwd=", "-F", "archive=",
+                    f"http://{roku_ip()}/plugin_inspect").decode(errors="replace")
+    m = re.search(r"pkgs/dev\.(jpg|png)\?time=\d+", html)
+    if not m:
+        sys.exit("No screenshot: the Browser (dev) app has to be on screen.")
+    out = Path(out or f"roku-{time.strftime('%Y%m%d-%H%M%S')}.{m.group(1)}")
+    out.write_bytes(dev_curl(f"http://{roku_ip()}/{m.group(0)}"))
+    print(out)
+
+
+def build_browser():
+    fd, name = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    with zipfile.ZipFile(name, "w", zipfile.ZIP_DEFLATED) as z:
+        for top in BROWSER_FILES:
+            p = CHANNEL / top
+            for f in [p] if p.is_file() else sorted(p.rglob("*")):
+                if f.is_file():
+                    z.write(f, f.relative_to(CHANNEL).as_posix())
+    return name
+
+
+def cmd_sideload(zip_path=None):
+    built = zip_path is None
+    zip_path = zip_path or build_browser()
+    try:
+        html = dev_curl("-F", "mysubmit=Install", "-F", f"archive=@{zip_path}",
+                        f"http://{roku_ip()}/plugin_install").decode(errors="replace")
+    finally:
+        if built:
+            os.unlink(zip_path)
+    msgs = list(dict.fromkeys(re.findall(r'"text":"([^"]+)"', html)))
+    print("\n".join(msgs) or "No reply from the Roku's developer server.")
+    if not any("Success" in m or "Identical" in m for m in msgs):
+        sys.exit(1)
+
+
+def cmd_console():
+    with socket.create_connection((roku_ip(), 8085)) as s:
+        while chunk := s.recv(4096):
+            sys.stdout.write(chunk.decode(errors="replace"))
+            sys.stdout.flush()
+
+
+def cmd_find():
+    found = discover()
+    for ip in found:
+        print(ip, tag(ecp_at(ip, "query/device-info"), "friendly-device-name"))
+    if found:
+        cfg = config()
+        cfg["roku"] = found[0]
+        save_config(cfg)
+
+
+def ecp_at(ip, path):
+    with urllib.request.urlopen(f"http://{ip}:8060/{path}", timeout=3) as r:
+        return r.read().decode()
+
+
+def cmd_remote():
+    import termios
+    import tty
+    keys = {"\x1b[A": "Up", "\x1b[B": "Down", "\x1b[C": "Right", "\x1b[D": "Left", "\r": "Select",
+            "\x7f": "Back", "\x1b": "Back", "h": "Home", " ": "Play", ",": "Rev", ".": "Fwd",
+            "*": "Info", "r": "InstantReplay", "+": "VolumeUp", "=": "VolumeUp", "-": "VolumeDown",
+            "m": "VolumeMute"}
+    print("Remote: arrows, Enter=OK, Backspace=Back, h=Home, space=Play/Pause, , . = rewind/forward,\n"
+          "* = options, r = replay, + - m = volume, / = type text, q = quit")
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = os.read(fd, 8).decode(errors="ignore")
+            if ch in ("q", "\x03"):
+                break
+            if ch == "/":
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                text = input("\rtype> ")
+                if text:
+                    cmd_type(text)
+                tty.setraw(fd)
+            elif ch in keys:
+                ecp(f"keypress/{keys[ch]}")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        print()
+
+
+COMMANDS = {"key": cmd_key, "type": cmd_type, "browser": cmd_browser, "open": cmd_open, "play": cmd_play, "launch": cmd_launch,
+            "apps": cmd_apps, "now": cmd_now, "info": cmd_info, "shot": cmd_shot, "sideload": cmd_sideload,
+            "console": cmd_console, "find": cmd_find}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        return cmd_remote()
+    if args[0] in ("-h", "--help", "help") or args[0] not in COMMANDS:
+        print(__doc__.strip())
+        return
+    try:
+        COMMANDS[args[0]](*args[1:])
+    except TypeError:
+        print(__doc__.strip())
+        sys.exit(2)
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"Couldn't reach the Roku: {e}")
+
+
+if __name__ == "__main__":
+    main()

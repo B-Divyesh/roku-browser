@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component name="PollTask" extends="Task">
+  <interface>
+    <field id="server" type="string"/>
+    <field id="update" type="assocarray"/>
+    <field id="online" type="boolean" value="false"/>
+  </interface>
+  <script type="text/brightscript" uri="PollTask.brs"/>
+</component>

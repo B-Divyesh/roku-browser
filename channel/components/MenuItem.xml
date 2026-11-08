@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component name="MenuItem" extends="Group">
+  <interface>
+    <field id="itemContent" type="node" onChange="onContent"/>
+    <field id="focusPercent" type="float" onChange="onFocus"/>
+  </interface>
+  <script type="text/brightscript"><![CDATA[
+    sub init()
+        m.bg = m.top.findNode("bg")
+        m.title = m.top.findNode("title")
+        m.value = m.top.findNode("value")
+    end sub
+
+    sub onContent()
+        m.title.text = m.top.itemContent.title
+        m.value.text = m.top.itemContent.description
+    end sub
+
+    ' The row draws its own pill so it fits exactly and cross-fades as focus moves.
+    sub onFocus()
+        m.bg.opacity = m.top.focusPercent
+        if m.top.focusPercent > 0.5
+            m.title.color = "0x1A141BFF"
+            m.value.color = "0x1A141BB0"
+        else
+            m.title.color = "0xF0E4D4FF"
+            m.value.color = "0xB5A698FF"
+        end if
+    end sub
+  ]]></script>
+  <children>
+    <Poster id="bg" uri="pkg:/images/focus.9.png" width="472" height="52" blendColor="0xE89B5EFF" opacity="0"/>
+    <Label id="title" translation="[22, 0]" width="300" height="52" vertAlign="center" color="0xF0E4D4FF">
+      <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="21"/>
+    </Label>
+    <Label id="value" translation="[250, 0]" width="200" height="52" vertAlign="center" horizAlign="right" color="0xB5A698FF">
+      <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="19"/>
+    </Label>
+  </children>
+</component>
