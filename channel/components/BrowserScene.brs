@@ -638,6 +638,7 @@ sub setPill(label as object, bg as object, group as object, text as string, y as
     if w > 880 then w = 880
     label.width = w
     bg.width = w + pad * 2
+    group.findNode(bg.id.replace("Bg", "Edge")).width = bg.width
     group.translation = [(1280 - bg.width) / 2, y]
 end sub
 

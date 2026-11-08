@@ -192,6 +192,7 @@ if __name__ == "__main__":
     nine_patch(28, "card")
     nine_patch(14, "focus")
     nine_patch_ring(10, 3, "ring")
+    nine_patch_ring(22, 2, "pill_edge")
     cursor()
     ring()
     spinner()

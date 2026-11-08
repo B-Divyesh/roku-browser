@@ -21,14 +21,16 @@
     <Poster id="cursor" uri="pkg:/images/cursor.png" width="40" height="40"/>
 
     <Group id="toast" opacity="0">
-      <Poster id="toastBg" uri="pkg:/images/pill.9.png" blendColor="0x1A141BFF" opacity="0.94" height="46"/>
+      <Poster id="toastBg" uri="pkg:/images/pill.9.png" blendColor="0x2B222BFF" opacity="1" height="46"/>
+      <Poster id="toastEdge" uri="pkg:/images/pill_edge.9.png" blendColor="0x54444FFF" height="46"/>
       <Label id="toastLabel" translation="[24, 0]" height="46" vertAlign="center" color="0xF0E4D4FF">
         <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="19"/>
       </Label>
     </Group>
 
     <Group id="notice" opacity="0">
-      <Poster id="noticeBg" uri="pkg:/images/pill.9.png" blendColor="0x1A141BFF" opacity="0.94" height="50"/>
+      <Poster id="noticeBg" uri="pkg:/images/pill.9.png" blendColor="0x2B222BFF" opacity="1" height="50"/>
+      <Poster id="noticeEdge" uri="pkg:/images/pill_edge.9.png" blendColor="0x54444FFF" height="50"/>
       <Label id="noticeLabel" translation="[26, 0]" height="50" vertAlign="center" color="0xF0E4D4FF">
         <Font role="font" uri="pkg:/fonts/Inter-Medium.ttf" size="20"/>
       </Label>

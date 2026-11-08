@@ -129,7 +129,7 @@ a.tile { display: flex; flex-direction: column; align-items: center; gap: 10px; 
   transition: background .12s, border-color .12s, transform .12s; }
 a.tile:hover { background: var(--raised); border-color: var(--amber); transform: translateY(-2px); }
 .icon { width: 54px; height: 54px; border-radius: 14px; background: #f6efe6; display: grid; place-items: center; }
-.icon img { width: 32px; height: 32px; }
+.icon img { width: 34px; height: 34px; }
 .tip { margin-top: 20px; text-align: center; color: var(--muted); font-size: 14px; }
 .tip b { color: var(--text); font-weight: 600; }
 </style></head>
@@ -975,7 +975,7 @@ def make_app(b):
     async def start(req):
         tiles = "".join(
             f'<a class="tile" href="{url}"><span class="icon"><img alt="" '
-            f'src="https://icons.duckduckgo.com/ip3/{urlparse(url).hostname}.ico"></span>{name}</a>'
+            f'src="https://www.google.com/s2/favicons?domain={urlparse(url).hostname}&sz=128"></span>{name}</a>'
             for name, url in FAVOURITES)
         page = START_HTML.replace("%TILES%", tiles).replace("%SEARCH%", json.dumps(b.cfg["search"]))
         return web.Response(text=page, content_type="text/html")
