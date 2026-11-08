@@ -66,7 +66,10 @@ sudo apt install git python3 python3-aiohttp python3-pil curl chromium
 sudo dnf install git python3 python3-aiohttp python3-pillow curl chromium
 ```
 
-(If Brave or Google Chrome is already installed, you can skip `chromium`.)
+(If Brave or Google Chrome is already installed, you can skip `chromium`. On **Ubuntu**,
+`chromium` comes as a snap, and snaps can't use the hidden folder the browser profile lives in.
+Install [Google Chrome](https://www.google.com/chrome/) or [Brave](https://brave.com/linux/)
+from their own packages instead.)
 
 Then:
 
@@ -86,6 +89,27 @@ The installer:
 6. waits until the TV has connected.
 
 If a firewall is running, it tells you which ports to open (8765/tcp and 8766/udp).
+
+A successful run looks like this:
+
+```
+==> Checking this laptop
+    python3, aiohttp, pillow, curl and brave are all here.
+==> Looking for Rokus on this network
+    Living room (Streaming Stick, Roku OS 15.3.4) at 192.168.1.50
+    Developer mode is on and the password works; saved to ~/.config/roku/config.json (only you can read it).
+==> Installing roku-browser to ~/.local/share/roku-browser/app
+    Service running and starting with your login.
+==> Installing the Browser app on the Roku
+    Application Received: 421180 bytes stored.
+    Install Success.
+==> Waiting for the TV to connect
+    Connected. The Browser app is showing on your TV.
+```
+
+If it can't find the Roku, look up its address on the Roku under **Settings → Network → About**
+and run `ROKU_IP=that.address ./install.sh`. The `roku` command is installed to `~/.local/bin`;
+most distributions already have that on your `PATH`.
 
 After this, the *Browser* app is on the Roku home screen. You can delete the cloned folder;
 run `./install.sh` again from a fresh clone to update.
