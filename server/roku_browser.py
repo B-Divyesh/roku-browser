@@ -121,6 +121,9 @@ MEDIA_JS = r"""(() => {
   };
 })()"""
 
+# Lite mode's pages, compiled from the rendered page by the laptop's browser.
+LITE_COMPILE_JS = (Path(__file__).parent / "lite_compile.js").read_text()
+
 # Describes the focused field after a click, so the channel can pop up its keyboard.
 FOCUSED_FIELD_JS = r"""(() => {
   let e = document.activeElement;
@@ -232,6 +235,22 @@ def local_ip_for(remote):
         return s.getsockname()[0]
 
 
+def shrink_image(data, width):
+    """A page image at the width Lite mode shows it, as JPEG (or PNG where it's see-through):
+    quick for a Roku to decode, whatever the site sent (WebP, AVIF, huge photos)."""
+    with Image.open(io.BytesIO(data)) as im:
+        im.seek(0)
+        im = im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB")
+        if im.width > width:
+            im.thumbnail((width, width * 4))
+        out = io.BytesIO()
+        if im.mode == "RGBA" and im.getextrema()[3][0] < 255:
+            im.save(out, "PNG")
+            return out.getvalue(), "image/png"
+        im.convert("RGB").save(out, "JPEG", quality=82)
+        return out.getvalue(), "image/jpeg"
+
+
 def to_jpeg(png):
     with Image.open(io.BytesIO(png)) as im:
         out = io.BytesIO()
@@ -340,6 +359,8 @@ class Browser:
         self.history = {}               # target id -> navigation history
         self.media = {}                 # target id -> playable streams seen on the page
         self.frames = {}                # session of an embedded frame -> its page's target id
+        self.private_contexts = set()   # browser contexts whose tabs never reach the TV
+        self.listeners = {}             # session -> callback(method, params), for those tabs
         self.request_headers = {}       # (session, request id) -> headers that matter for replaying it
         self.last_click = 0.0           # videos only go to the TV's player when the user started them
         self.handoff = None             # the page video now playing in the TV's player
@@ -527,8 +548,13 @@ class Browser:
 
     def _event(self, method, p, session):
         """Runs inside the reader, so anything that calls CDP goes in a task."""
+        if session in self.listeners:
+            self.listeners[session](method, p)
+            return
         if method == "Target.targetCreated":
             t = p["targetInfo"]
+            if t.get("browserContextId") in self.private_contexts:
+                return
             if t["type"] == "page" and not t["url"].startswith(("chrome-extension:", "brave:", "chrome:")):
                 self.info[t["targetId"]] = {"url": t["url"], "title": t["title"]}
                 asyncio.create_task(self._adopt(t["targetId"]))
@@ -1302,6 +1328,67 @@ class Browser:
 ROKU_UA = "Roku/DVP-15.3"
 
 
+class Renderer:
+    """Lite mode's pages, run through this laptop's browser when it's reachable: the
+    JavaScript runs, CSS decides what's visible, and the page comes back already in Lite
+    mode's own structure (lite_compile.js). The Roku then only reads JSON, with its
+    built-in parser, instead of parsing HTML in BrightScript, and lays it out natively.
+    Uses a tab of its own in a private context, so the TV's tabs never see it."""
+
+    def __init__(self, browser):
+        self.b = browser
+        self.sid = None
+        self.ws = None                  # the browser connection that tab belongs to
+        self.waiting = {}               # CDP event -> asyncio.Event
+        self.lock = asyncio.Lock()      # one page at a time
+
+    async def render(self, url):
+        async with self.lock:
+            await self.b.ensure()
+            await self._tab()
+            loaded = self.waiting["Page.domContentEventFired"] = asyncio.Event()
+            began = time.monotonic()
+            r = await self.b.call("Page.navigate", {"url": url}, self.sid)
+            if r.get("errorText"):
+                raise web.HTTPBadGateway(text=r["errorText"])
+            try:
+                await asyncio.wait_for(loaded.wait(), 10)
+            except asyncio.TimeoutError:
+                pass
+            # Pages built with JavaScript fill in after that; give them a few moments.
+            while True:
+                r = await self.b.call("Runtime.evaluate", {"expression": LITE_COMPILE_JS, "returnByValue": True},
+                                      self.sid, timeout=10)
+                doc = r.get("result", {}).get("value") or {}
+                if doc.get("chars", 0) >= 600 or time.monotonic() - began > 6:
+                    break
+                await asyncio.sleep(0.5)
+            log.info("lite page compiled: %s, %d blocks in %.1f s", url[:90], len(doc.get("blocks", [])),
+                     time.monotonic() - began)
+            return doc
+
+    async def _tab(self):
+        if self.sid and self.ws is self.b.ws and self.b.running:
+            return
+        ctx = (await self.b.call("Target.createBrowserContext", {"disposeOnDetach": True}))["browserContextId"]
+        self.b.private_contexts.add(ctx)
+        tid = (await self.b.call("Target.createTarget", {"url": "about:blank", "browserContextId": ctx}))["targetId"]
+        self.sid = (await self.b.call("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+        self.ws = self.b.ws
+        self.b.listeners[self.sid] = self._event
+        for method, params in (
+            ("Page.enable", {}),
+            ("Emulation.setUserAgentOverride", {"userAgent": self.b.ua, "acceptLanguage": "en-GB,en"}),
+            ("Emulation.setDeviceMetricsOverride", {"width": 1280, "height": 900, "deviceScaleFactor": 1,
+                                                    "mobile": False}),
+        ):
+            await self.b.call(method, params, self.sid)
+
+    def _event(self, method, p):
+        if method in self.waiting:
+            self.waiting.pop(method).set()
+
+
 class Remuxer:
     """Repackages a stream with ffmpeg (copying, not re-encoding) into HLS with TS segments.
 
@@ -1953,6 +2040,48 @@ def make_app(b):
                                 headers={"Cache-Control": "no-store"})
         return web.FileResponse(path, headers={"Content-Type": "video/mp2t", "Cache-Control": "no-store"})
 
+    async def lite(req):
+        """A page compiled for Lite mode (see Renderer)."""
+        url = req.query.get("u", "")
+        if not url.startswith(("http://", "https://")):
+            raise web.HTTPBadRequest()
+        try:
+            doc = await renderer.render(url)
+        except (CDPError, asyncio.TimeoutError) as e:
+            raise web.HTTPBadGateway(text=str(e))
+        shrink = lambda u, w: f"{b.base_url()}/img?w={w}&u={quote(u, safe='')}" if u else u
+        for blk in doc.get("blocks", []):
+            if blk.get("k") == "img":
+                blk["src"] = shrink(blk["src"], 1040)
+            elif blk.get("k") == "video":
+                blk["thumb"] = shrink(blk.get("thumb", ""), 640)
+        doc["image"] = shrink(doc.get("image", ""), 640)
+        return web.json_response(doc)
+
+    async def img(req):
+        url = req.query.get("u", "")
+        width = max(64, min(int(req.query.get("w") or 1040), 1920))
+        if not url.startswith(("http://", "https://")):
+            raise web.HTTPBadRequest()
+        hit = images.get((url, width))
+        if hit is None:
+            try:
+                async with b.http.get(url, headers={"User-Agent": b.ua or "Mozilla/5.0", "Accept": "image/*"},
+                                      timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status != 200:
+                        raise web.HTTPNotFound()
+                    data = await r.content.read(15 << 20)
+                hit = await asyncio.to_thread(shrink_image, data, width)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+                raise web.HTTPNotFound()
+            images[(url, width)] = hit
+            while len(images) > 150:
+                images.pop(next(iter(images)))
+        body, kind = hit
+        return web.Response(body=body, content_type=kind, headers={"Cache-Control": "max-age=3600"})
+
+    images = {}                         # (address, width) -> (bytes, type), most recent last
+    renderer = Renderer(b)
     remuxer = Remuxer()
     b.remuxer = remuxer
     mirror = Mirror(b)
@@ -1965,6 +2094,7 @@ def make_app(b):
         web.get("/remux", remux), web.get("/remux/{key}/{name}", remux_file),
         web.get("/dailymotion/{id}", dailymotion),
         web.post("/mirror", mirror_), web.get("/mirror/{token}/{name}", mirror_file),
+        web.get("/lite", lite), web.get("/img", img),
     ])
     return app
 

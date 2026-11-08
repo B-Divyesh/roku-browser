@@ -96,6 +96,11 @@ function load(req as object) as object
     fmt = mediaFormat(url)
     if fmt <> "" then return {play: {url: url, format: fmt, title: Mid(urlPath(url), lastIndexOf(urlPath(url), "/") + 1), headers: []}}
 
+    if req.helper <> invalid and req.helper <> "" and req.post = invalid and LCase(Left(url, 4)) = "http"
+        doc = laptopDoc(url, req.helper)
+        if doc <> invalid then return {doc: doc}
+    end if
+
     t = CreateObject("roTimespan")
     resp = http(url, req.post)
     if resp.code <= 0 and req.post = invalid and resp.error <> "the site took too long to answer"
@@ -133,6 +138,20 @@ function load(req as object) as object
         doc.blocks.Push({k: "caption", r: [{s: note, a: -1, b: false, o: 0}], t: note})
     end if
     return {doc: doc}
+end function
+
+' The page as the laptop's browser rendered it, JavaScript and all, already in Lite
+' mode's own structure: one JSON read instead of parsing HTML here. Invalid when the
+' laptop can't, so the page is fetched and parsed here as before.
+function laptopDoc(url as string, helper as string) as dynamic
+    t = CreateObject("roTimespan")
+    resp = http(helper + "/lite?u=" + m.http.Escape(url), invalid, "application/json")
+    if resp.code <> 200 then return invalid
+    fetchMs = t.TotalMilliseconds()
+    doc = ParseJson(resp.body)
+    if doc = invalid or doc.blocks = invalid or doc.blocks.Count() = 0 then return invalid
+    print "lite: "; url; " compiled by the laptop: "; Len(resp.body); " chars in "; fetchMs; " ms, read in "; t.TotalMilliseconds() - fetchMs; " ms"
+    return doc
 end function
 
 function failureDoc(url as string, resp as object) as object
