@@ -6,22 +6,26 @@ A web browser for your Roku TV or stick, driven by the Roku remote. It works two
   runs a hidden Brave/Chromium, renders pages at the TV's resolution and streams them as
   sharp frames. On the TV, the remote becomes a mouse: the cursor is drawn on the Roku, so it
   moves instantly, and links light up as you pass over them. Every site works, as on a computer.
-- **Lite mode, on the Roku by itself.** When the laptop isn't around, the app fetches and
-  reads pages itself and lays them out natively: text, links, pictures, search boxes. The
-  remote moves between the things you can click. Sites that need JavaScript can't run here,
-  but news, reference, search and plenty more work, and YouTube and Dailymotion get native
-  pages built from their own data services.
+  Only what changed on screen is sent, and scrolling moves the picture on the TV at once.
+  Press play on a video in a page and it moves to the Roku's own player, smooth and with sound.
+- **Lite mode, laid out by the Roku itself.** Pages come as text, links, pictures and search
+  boxes laid out natively, and the remote moves between the things you can click. While the
+  laptop is reachable, its browser runs each page (JavaScript and all) and hands the Roku the
+  finished layout, so nearly every site works and pages appear in a fraction of a second.
+  Without the laptop, the Roku reads pages itself: sites that need JavaScript can't run then,
+  but news, reference, search and plenty more work. YouTube and Dailymotion get native pages
+  built from their own data services either way.
 
 The app picks for you: full browser when the laptop answers, Lite mode after a few seconds
 if it doesn't, and you can switch from the menu at any time.
 
 | | Full browser (laptop) | Lite mode (Roku alone) |
 |---|---|---|
-| Websites | Every site, as on a computer | Sites that work without JavaScript: news, Wikipedia, search, forums, blogs |
+| Websites | Every site, as on a computer | With the laptop on: nearly every site, laid out for reading. Alone: sites that work without JavaScript (news, Wikipedia, search, forums, blogs) |
 | YouTube | Browse youtube.com; videos open in the YouTube app | Search and results on the TV; videos open in the YouTube app |
 | Dailymotion | Plays on the TV with sound | Trending and search on the TV; plays with sound while the laptop is on, picture only without it |
-| Other videos | Videos found on a page play in the Roku's own player | `<video>` tags, embedded players and video links play in the Roku's own player |
-| Search | Brave Search | DuckDuckGo |
+| Other videos | Press play and the video moves to the Roku's own player, with sound | `<video>` tags, embedded players and video links play in the Roku's own player |
+| Search | Brave Search, or your choice from the top bar | DuckDuckGo |
 
 Everything stays on your home network; nothing goes through a third-party server.
 
@@ -197,6 +201,7 @@ setup if you only want Lite mode.
 | Remote button | Does |
 |---|---|
 | Arrows | Move the cursor (hold to speed up). Links and buttons light up under it; push past an edge to scroll |
+| Cursor to the top edge | The top bar: back, forward, reload, the address (OK to search or type one) and the search engine |
 | OK | Click. Clicking a text box opens the keyboard |
 | Play/Pause | Search or type an address |
 | ✱ (Options) | Menu: search, play the page's video on the TV, show the laptop's screen, forward, reload, text size, start page, exit |
@@ -205,6 +210,14 @@ setup if you only want Lite mode.
 | Back | Go back; press twice on the first page to exit |
 
 The cursor fades out when you stop using the remote; any button brings it back.
+
+**Videos in pages.** The full browser reaches the TV as pictures, which is perfect for reading
+and hopeless for video: a few frames a second, and no sound. So when you press play on a video
+in a page, it moves to the Roku's own player instead: the laptop fetches the stream the way the
+page did (it works for players embedded from other sites, too), converts the sound to stereo
+AAC, which every Roku plays, and the TV plays it smoothly. **Back** returns to the page, with the
+video paused where you stopped. Short adverts and muted previews are left alone. If a video
+stays in the page, ✱ → *Play video on TV* does the same by hand.
 
 In **Lite mode** the same buttons apply, except that the arrows move between links, boxes and
 videos instead of a cursor: Up and Down go to the nearest one above or below (and scroll
@@ -287,6 +300,10 @@ Roku's player always keeps a few seconds in hand, and needs `wf-recorder`.
 - **Dailymotion plays without sound** in Lite mode when the laptop is off: the Roku can't
   decode the audio of Dailymotion's streams by itself. With the laptop service running (and
   `ffmpeg` installed), the laptop repackages them and they play with sound.
+- **A video in a page plays as a slideshow, without sound.** Press play on it (OK on its play
+  button): it should move to the TV's own player. If it's already playing, pause it and play
+  it again, or use ✱ → *Play video on TV*. Sites that protect their videos (Netflix, iPlayer,
+  Disney+) can't be moved; use their Roku apps.
 - **YouTube opens the YouTube app.** That's deliberate: it plays everything, at full quality,
   with your account. Back on the remote returns to the Roku home screen.
 - Logs: `journalctl --user -u roku-browser -f` on the laptop, `roku console` for the Roku app.
@@ -315,9 +332,12 @@ Roku's player always keeps a few seconds in hand, and needs `wf-recorder`.
 
 ```
 server/roku_browser.py   laptop service: headless browser over the DevTools protocol, frame
-                         capture (PNG → 4:4:4 JPEG), click targets, input, video hand-off,
+                         capture (whole frames or just the changed rectangle, as JPEG), click
+                         targets, input, moving page videos to the Roku's player,
                          UDP discovery, HTTP API for the Roku app and the roku command,
-                         screen mirroring (AirPlay via doubletake, or HLS for the Roku's player)
+                         screen mirroring (AirPlay via doubletake, or HLS for the Roku's player),
+                         Lite pages compiled by the laptop's browser, and images resized for them
+server/lite_compile.js   turns a rendered page into Lite mode's own block structure
 channel/                 the Roku app (SceneGraph + BrightScript)
   components/BrowserScene  page frames (double-buffered), cursor, highlights, menu, keyboard, video
   components/PollTask      long-polls the laptop for new frames; finds it by broadcast

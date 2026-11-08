@@ -1,7 +1,7 @@
 title=Browser
 subtitle=The web on your TV, rendered by your laptop
 major_version=1
-minor_version=2
+minor_version=3
 build_version=0
 mm_icon_focus_hd=pkg:/images/icon_hd.png
 mm_icon_focus_fhd=pkg:/images/icon_fhd.png
