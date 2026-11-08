@@ -90,12 +90,45 @@ CLICKABLE_JS = r"""(() => {
   return out;
 })()"""
 
+# Runs in every page and frame: reports a video or audio element starting to play, so its
+# stream can go to the TV's own player. The page itself only reaches the TV as pictures,
+# a few a second and silent, which is fine for reading and hopeless for watching.
+MEDIA_BINDING = "__rokuBrowserMedia"
+MEDIA_JS = r"""(() => {
+  if (window.__rokuBrowserWatching) return;
+  window.__rokuBrowserWatching = true;
+  const report = v => {
+    if (typeof __rokuBrowserMedia !== 'function') return;
+    window.__rokuBrowserPlaying = v;
+    const r = v.getBoundingClientRect();
+    __rokuBrowserMedia(JSON.stringify({
+      src: v.currentSrc || v.src || '', time: v.currentTime,
+      duration: isFinite(v.duration) ? v.duration : -1, muted: v.muted || v.volume === 0,
+      video: v.tagName === 'VIDEO', area: (r.width * r.height) / (innerWidth * innerHeight || 1)}));
+  };
+  document.addEventListener('playing', e => {
+    if (e.target instanceof HTMLMediaElement) report(e.target);
+  }, true);
+  // Players built as web components keep their <video> in a shadow root, whose media
+  // events never reach the document; they all start it with play(), though.
+  const play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    if (!this.__rokuBrowserHooked) {
+      this.__rokuBrowserHooked = true;
+      if (this.getRootNode() !== document) this.addEventListener('playing', () => report(this));
+    }
+    return play.apply(this, arguments);
+  };
+})()"""
+
 # Describes the focused field after a click, so the channel can pop up its keyboard.
 FOCUSED_FIELD_JS = r"""(() => {
   let e = document.activeElement;
   while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;
   if (!e) return null;
-  if (e.tagName === 'IFRAME') return {kind: 'text', value: '', label: '', multiline: false};
+  // Focus inside a frame from another site: the server asks that frame instead.
+  if (e.tagName === 'IFRAME') return {frame: true};
+  if (window !== top && !document.hasFocus()) return null;
   const type = (e.type || '').toLowerCase();
   const nonText = ['button','submit','checkbox','radio','range','color','file','image','reset','hidden'];
   const editable = e.isContentEditable || e.tagName === 'TEXTAREA' ||
@@ -250,6 +283,40 @@ def dailymotion_id(url):
     return None
 
 
+def hls_choice(text, base):
+    """From an HLS master playlist: the best picture up to 1080p (H.264 if there's a
+    choice) and its stereo AAC soundtrack when that's a separate playlist. Fed the whole
+    master, ffmpeg reads every variant and falls far behind real time."""
+    def attrs(line):
+        return {k: v.strip('"') for k, v in re.findall(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)', line.split(":", 1)[1])}
+    lines = [ln.strip() for ln in text.splitlines()]
+    variants, audio = [], {}
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            uri = next((ln for ln in lines[i + 1:] if ln and not ln.startswith("#")), None)
+            if uri:
+                variants.append((attrs(line), urljoin(base, uri)))
+        elif line.startswith("#EXT-X-MEDIA:"):
+            a = attrs(line)
+            if a.get("TYPE") == "AUDIO" and a.get("URI"):
+                audio.setdefault(a.get("GROUP-ID"), []).append(a)
+    if not variants:
+        return base, None
+
+    def score(v):
+        a = v[0]
+        height = int((a.get("RESOLUTION", "0x0").split("x") + ["0"])[1] or 0)
+        codecs = a.get("CODECS", "")
+        return (height <= 1080, "mp4a" in codecs or "AUDIO" not in a, "avc1" in codecs,
+                height if height <= 1080 else -height, int(a.get("BANDWIDTH", 0)))
+    best, uri = max(variants, key=score)
+    group = audio.get(best.get("AUDIO"))
+    if not group:
+        return uri, None
+    track = max(group, key=lambda a: (a.get("DEFAULT") == "YES", a.get("LANGUAGE", "").startswith("en")))
+    return uri, urljoin(base, track["URI"])
+
+
 def format_for(path_or_url):
     return EXT_FORMAT.get(Path(urlparse(str(path_or_url)).path).suffix.lower())
 
@@ -272,6 +339,12 @@ class Browser:
         self.info = {}                  # target id -> {"url", "title"}
         self.history = {}               # target id -> navigation history
         self.media = {}                 # target id -> playable streams seen on the page
+        self.frames = {}                # session of an embedded frame -> its page's target id
+        self.request_headers = {}       # (session, request id) -> headers that matter for replaying it
+        self.last_click = 0.0           # videos only go to the TV's player when the user started them
+        self.handoff = None             # the page video now playing in the TV's player
+        self.playing = None             # (target, session, details) of the media last started
+        self.no_handoff = set()         # streams the TV's player couldn't play
         self.loading = set()
         self.frame_no = 0
         self.jpeg = b""
@@ -469,8 +542,36 @@ class Browser:
                     self._save_session()
                     self.bump()
             return
+        if method == "Target.attachedToTarget":
+            owner = self._target_for(session) or self.frames.get(session)
+            if owner and p["targetInfo"]["type"] == "iframe":
+                self.frames[p["sessionId"]] = owner
+                asyncio.create_task(self._watch(p["sessionId"]))
+            return
+        if method == "Target.detachedFromTarget":
+            self.frames.pop(p.get("sessionId"), None)
+            return
         tid = self._target_for(session) if session else None
         if tid is None:
+            # An embedded frame: only its streams and its playing media matter.
+            tid = self.frames.get(session)
+            if tid is None or method not in ("Network.requestWillBeSent", "Network.responseReceived",
+                                             "Runtime.bindingCalled"):
+                return
+        if method == "Network.requestWillBeSent":
+            h = {k.lower(): v for k, v in p["request"].get("headers", {}).items()}
+            keep = {k: h[k] for k in ("referer", "origin", "user-agent") if k in h}
+            if keep:
+                self.request_headers[(session, p["requestId"])] = keep
+                while len(self.request_headers) > 500:
+                    self.request_headers.pop(next(iter(self.request_headers)))
+            return
+        if method == "Runtime.bindingCalled":
+            if p.get("name") == MEDIA_BINDING and tid == self.active:
+                try:
+                    asyncio.create_task(self._media_playing(tid, session, json.loads(p.get("payload", "{}"))))
+                except ValueError:
+                    pass
             return
         if method == "Page.screencastFrame":
             asyncio.create_task(self._ack(session, p["sessionId"]))
@@ -498,7 +599,7 @@ class Browser:
             if p.get("message") and p["type"] != "beforeunload":
                 self.notify_tv(p["message"][:160])
         elif method == "Network.responseReceived":
-            self._sniff(tid, p)
+            self._sniff(tid, session, p)
         elif method == "Inspector.targetCrashed":
             asyncio.create_task(self.call("Page.reload", {}, session))
 
@@ -519,24 +620,53 @@ class Browser:
         self.sessions[tid] = sid
         for method, params in (
             ("Page.enable", {}),
-            ("Network.enable", {}),
             ("Emulation.setDeviceMetricsOverride", self.metrics()),
             ("Emulation.setScrollbarsHidden", {"hidden": True}),
             ("Emulation.setFocusEmulationEnabled", {"enabled": True}),
-            ("Emulation.setUserAgentOverride", {
-                "userAgent": self.ua, "acceptLanguage": "en-GB,en", "platform": "Linux",
-                "userAgentMetadata": {
-                    "brands": [{"brand": "Chromium", "version": self.major},
-                               {"brand": "Brave", "version": self.major},
-                               {"brand": "Not_A Brand", "version": "24"}],
-                    "fullVersion": self.major, "platform": "Linux", "platformVersion": "",
-                    "architecture": "x86", "model": "", "mobile": False}}),
         ):
             try:
                 await self.call(method, params, sid)
             except CDPError as e:
                 log.debug("%s: %s", method, e)
+        await self._watch(sid)
         await self._activate(tid)
+
+    async def _watch(self, sid):
+        """For a page and every frame embedded in it: our user agent, network events (to
+        find video streams) and the play reporter. Frames from other sites are separate
+        targets, and video players very often are one."""
+        # A frame is caught before its document exists; Chrome applies scripts and
+        # bindings to documents still to come only with these domains switched on.
+        early = (("Page.enable", {}), ("Runtime.enable", {})) if sid in self.frames else ()
+        try:
+            for method, params in (
+                *early,
+                ("Network.enable", {}),
+                ("Emulation.setUserAgentOverride", {
+                    "userAgent": self.ua, "acceptLanguage": "en-GB,en", "platform": "Linux",
+                    "userAgentMetadata": {
+                        "brands": [{"brand": "Chromium", "version": self.major},
+                                   {"brand": "Brave", "version": self.major},
+                                   {"brand": "Not_A Brand", "version": "24"}],
+                        "fullVersion": self.major, "platform": "Linux", "platformVersion": "",
+                        "architecture": "x86", "model": "", "mobile": False}}),
+                ("Runtime.addBinding", {"name": MEDIA_BINDING}),
+                ("Page.addScriptToEvaluateOnNewDocument", {"source": MEDIA_JS}),
+                ("Runtime.evaluate", {"expression": MEDIA_JS}),
+                ("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True,
+                                          "filter": [{"type": "iframe"}]}),
+            ):
+                try:
+                    await self.call(method, params, sid)
+                except (CDPError, asyncio.TimeoutError) as e:
+                    log.debug("%s: %s", method, e)
+        finally:
+            if sid in self.frames:
+                # Harmless if the frame wasn't waiting; never leave one paused.
+                try:
+                    await self.call("Runtime.runIfWaitingForDebugger", {}, sid)
+                except (CDPError, asyncio.TimeoutError):
+                    pass
 
     async def _activate(self, tid):
         old = self.active
@@ -554,6 +684,8 @@ class Browser:
         self.bump()
 
     async def _start_screencast(self, tid):
+        if tid not in self.sessions:
+            return                      # closed meanwhile
         try:
             await self.call("Page.startScreencast",
                             {"format": "jpeg", "quality": 10, "maxWidth": 160, "maxHeight": 90},
@@ -723,6 +855,21 @@ class Browser:
     async def mouse(self, kind, x, y, **extra):
         await self.page("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, **extra})
 
+    async def _field_in_frames(self):
+        """The text field focused inside one of the page's embedded frames, if any."""
+        for sid, tid in list(self.frames.items()):
+            if tid != self.active:
+                continue
+            try:
+                r = await self.call("Runtime.evaluate", {"expression": FOCUSED_FIELD_JS, "returnByValue": True},
+                                    sid, timeout=2)
+            except (CDPError, asyncio.TimeoutError):
+                continue
+            field = r.get("result", {}).get("value")
+            if field and not field.get("frame"):
+                return field
+        return None
+
     async def press(self, name, modifiers=0, commands=None):
         k = dict(KEYS[name])
         text = k.pop("text", None)
@@ -821,6 +968,7 @@ class Browser:
             async with self.pointer():
                 await self.mouse("mouseMoved", self.css(q, "x"), self.css(q, "y"))
         elif t == "click":
+            self.last_click = time.monotonic()
             x, y = self.css(q, "x"), self.css(q, "y")
             async with self.pointer():
                 await self.mouse("mouseMoved", x, y)
@@ -829,6 +977,8 @@ class Browser:
             await asyncio.sleep(0.25)
             r = await self.page("Runtime.evaluate", {"expression": FOCUSED_FIELD_JS, "returnByValue": True})
             field = r.get("result", {}).get("value")
+            if field and field.get("frame"):
+                field = await self._field_in_frames()
             return {"edit": field} if field else {}
         elif t == "scroll":
             async with self.pointer():
@@ -843,6 +993,7 @@ class Browser:
         elif t == "text":
             await self.type_text(q.get("s", ""), enter=q.get("enter") == "1", replace=q.get("replace", "1") == "1")
         elif t == "key":
+            self.last_click = time.monotonic()
             await self.press(q.get("k", "Enter"))
         elif t == "nav":
             await self.navigate(q.get("q", ""))
@@ -861,14 +1012,16 @@ class Browser:
             if len(self.tabs) > 1:
                 await self.call("Target.closeTarget", {"targetId": self.active})
         elif t == "video":
-            return await self.video_on_page()
+            return await self.hand_off()
+        elif t == "videoend":
+            await self.video_ended(float(q.get("pos") or 0), q.get("failed") == "1")
         else:
             raise web.HTTPBadRequest(text=f"unknown input {t}")
         return {}
 
     # ---- video hand-off --------------------------------------------------
 
-    def _sniff(self, tid, p):
+    def _sniff(self, tid, session, p):
         r = p["response"]
         url, mime = r["url"], (r.get("mimeType") or "").lower()
         if url.startswith(("blob:", "data:")):
@@ -882,39 +1035,156 @@ class Browser:
         if not fmt:
             return
         found = self.media.setdefault(tid, [])
-        # The first playlist is the master; later ones are its variants.
-        if any(m["url"] == url or (fmt == "hls" and m["format"] == "hls") for m in found):
+        if any(m["url"] == url for m in found):
             return
-        found.append({"url": url, "format": fmt})
+        found.append({"url": url, "format": fmt, "session": session, "request": p["requestId"],
+                      "seen": time.monotonic(),
+                      "headers": self.request_headers.get((session, p["requestId"]), {})})
+        del found[:-40]
         log.info("found %s stream on page: %s", fmt, url[:120])
         if tid == self.active:
             self.bump()
 
-    async def video_on_page(self):
-        info = self.info.get(self.active, {})
-        vid = youtube_id(info.get("url", ""))
+    async def hand_off(self, session=None, info=None):
+        """Plays the page's video in the TV's own player, smooth and with sound, and pauses
+        it in the page. YouTube opens in its app; anything else this laptop fetches the
+        way the page did and repackages for the Roku."""
+        tid = self.active
+        page_url = self.info.get(tid, {}).get("url", "")
+        vid = youtube_id(page_url)
         if vid:
             await self.ecp(f"launch/{YOUTUBE_APP}?contentId={quote(vid)}&mediaType=movie")
             return {"notice": "Opening in YouTube…"}
-        dm = dailymotion_id(info.get("url", ""))
+        dm = dailymotion_id(page_url)
         if dm:
             return await self.dailymotion_item(dm)
-        streams = self.media.get(self.active)
-        if streams:
-            m = streams[0]
-            headers = [f"User-Agent: {self.ua}", f"Referer: {info.get('url', '')}"]
+        if info is None and self.playing and self.playing[0] == tid:
+            _, session, info = self.playing
+        stream = await self._page_stream(tid, session, info)
+        if stream:
+            start = max(0.0, (info or {}).get("time", 0) - 1)
             try:
-                cookies = (await self.page("Network.getCookies", {"urls": [m["url"]]}))["cookies"]
-            except CDPError:
-                cookies = []
-            if cookies:
-                headers.append("Cookie: " + "; ".join(f"{c['name']}={c['value']}" for c in cookies))
-            return {"play": {"url": m["url"], "format": m["format"], "headers": headers,
-                             "title": info.get("title", "")}}
-        item = await self.ytdlp(info.get("url", ""))
+                item = await self._replay(stream, start)
+            except web.HTTPException:
+                self.no_handoff.add(stream["url"])
+                return {"notice": "The TV's player couldn't open this video"}
+            if session:
+                try:
+                    await self.call("Runtime.evaluate", {
+                        "expression": "window.__rokuBrowserPlaying && window.__rokuBrowserPlaying.pause()"}, session)
+                except CDPError:
+                    pass
+            self.handoff = {"url": stream["url"], "session": session, "start": start}
+            return {"play": item}
+        item = await self.ytdlp(page_url)
         if item:
             return {"play": item}
         return {"notice": "No playable video found on this page"}
+
+    async def _media_playing(self, tid, session, info):
+        """A video (or audio) started in the page. If the user started it and it isn't an
+        advert, it goes to the TV's player."""
+        self.playing = (tid, session, info)
+        log.info("page media playing: %s (muted=%s, %.0f%% of its frame, %.0f s long, last click %.0f s ago)",
+                 (info.get("src") or "?")[:90], info.get("muted"), 100 * info.get("area", 0),
+                 info.get("duration", -1), time.monotonic() - self.last_click)
+        if self.handoff and not await self._tv_playing():
+            self.handoff = None         # the TV's player was left some other way (Home, say)
+        if (self.handoff or self.paused or info.get("muted")
+                or time.monotonic() - self.last_click > 120     # not something the user started
+                or (info.get("video") and info.get("area", 0) < 0.08)    # a tiny or hidden player
+                or 0 < info.get("duration", -1) < 45            # an advert or a preview
+                or info.get("src") in self.no_handoff):
+            return
+        result = await self.hand_off(session, info)
+        log.info("handing the page's video to the TV: %s", result.get("play", {}).get("url") or result.get("notice"))
+        if "play" not in result:
+            self.no_handoff.add(info.get("src") or self.info.get(tid, {}).get("url", ""))
+        self.action = {"id": secrets.randbelow(1 << 30), **result}
+        self.bump()
+
+    async def video_ended(self, pos, failed):
+        """The TV's player stopped: the page's video waits, paused, where the TV got to."""
+        h, self.handoff = self.handoff, None
+        self.remuxer.stop(clean=True)
+        if not h:
+            return
+        if failed:
+            self.no_handoff.add(h["url"])
+        if h["session"]:
+            js = (f"(v => {{ if (v) {{ v.currentTime = {h['start'] + pos:.2f}; v.pause(); }} }})"
+                  "(window.__rokuBrowserPlaying)")
+            try:
+                await self.call("Runtime.evaluate", {"expression": js}, h["session"])
+            except CDPError:
+                pass
+        self.recapture()
+
+    async def _tv_playing(self):
+        try:
+            _, xml = await self.ecp("query/media-player", "GET")
+        except (aiohttp.ClientError, asyncio.TimeoutError, web.HTTPException):
+            return False
+        return 'id="dev"' in xml and re.search(r'state="(play|buffer|pause)"', xml) is not None
+
+    async def _page_stream(self, tid, session=None, info=None):
+        """The stream behind the playing media: its own address or, for players that feed
+        it in pieces (a blob: address), the playlist its frame loaded. Players load their
+        master playlist and then its variants; adverts come from frames of their own."""
+        src = (info or {}).get("src", "")
+        found = self.media.get(tid, [])
+        if src.startswith("http"):
+            known = next((m for m in found if m["url"] == src), None)
+            return known or {"url": src, "format": format_for(src) or "mp4", "session": session, "headers": {}}
+        lists = [m for m in found if m["format"] in ("hls", "dash")]
+        if session:
+            lists = [m for m in lists if m["session"] == session] or lists
+        if not lists:
+            return None if src else (found[-1] if found else None)
+        for m in reversed(lists):
+            if m["format"] == "dash" or await self._is_master(m):
+                return m
+        return lists[-1]
+
+    async def _is_master(self, m):
+        if "master" not in m:
+            m["master"] = "#EXT-X-STREAM-INF" in await self._body(m)
+        return m["master"]
+
+    async def _body(self, m):
+        """A playlist's text as the page received it."""
+        if "body" not in m:
+            m["body"] = ""
+            try:
+                r = await self.call("Network.getResponseBody", {"requestId": m["request"]}, m["session"])
+                m["body"] = base64.b64decode(r["body"]).decode(errors="replace") if r.get("base64Encoded") else r["body"]
+            except (CDPError, KeyError, ValueError):
+                pass
+        return m["body"]
+
+    async def _replay(self, m, start):
+        """This laptop fetches the stream as the page did (same referrer, origin, browser
+        and cookies) and repackages it as TS segments, whose sound a Roku always plays."""
+        h = m.get("headers", {})
+        info = self.info.get(self.active, {})
+        headers = [f"Referer: {h.get('referer') or info.get('url', '')}"]
+        if h.get("origin"):
+            headers.append(f"Origin: {h['origin']}")
+        try:
+            cookies = (await self.page("Network.getCookies", {"urls": [m["url"]]}))["cookies"]
+        except CDPError:
+            cookies = []
+        if cookies:
+            headers.append("Cookie: " + "; ".join(f"{c['name']}={c['value']}" for c in cookies))
+        url, audio = m["url"], None
+        if m["format"] == "hls":
+            text = await self._body(m)
+            if text:
+                url, audio = hls_choice(text, m["url"])
+        key = await self.remuxer.start(url, headers=headers, start=start,
+                                       user_agent=h.get("user-agent") or self.ua, audio=audio)
+        return {"url": f"{self.base_url()}/remux/{key}/index.m3u8", "format": "hls", "headers": [],
+                "title": info.get("title", ""), "page": True}
 
     async def dailymotion_item(self, video_id):
         """A Dailymotion video as a stream the Roku plays with sound (remuxed here)."""
@@ -1045,8 +1315,8 @@ class Remuxer:
         self.proc = None
         self.dir = DATA / "remux"
 
-    async def start(self, url):
-        key = hashlib.sha1(url.encode()).hexdigest()[:12]
+    async def start(self, url, headers=(), start=0.0, user_agent=ROKU_UA, audio=None):
+        key = hashlib.sha1(f"{url} {audio} {start:.1f}".encode()).hexdigest()[:12]
         out = self.dir / key
         alive = self.proc is not None and self.proc.returncode is None
         if key != self.key or not (alive or (out / "index.m3u8").exists()):
@@ -1055,14 +1325,26 @@ class Remuxer:
             shutil.rmtree(self.dir, ignore_errors=True)
             out.mkdir(parents=True)
             self.key = key
-            self.proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-nostdin", "-loglevel", "error", "-user_agent", ROKU_UA, "-i", url,
-                "-sn", "-dn", "-c", "copy", "-f", "hls", "-hls_time", "4",
-                "-hls_list_size", "0", "-hls_playlist_type", "event",
-                "-hls_segment_filename", str(out / "seg%05d.ts"), str(out / "index.m3u8"),
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
-                preexec_fn=die_with_parent)
-            log.info("remuxing %s", url[:100])
+            source = ["-user_agent", user_agent]
+            if headers:
+                source += ["-headers", "".join(h + "\r\n" for h in headers)]
+            if start:
+                source += ["-ss", f"{start:.2f}"]
+            inputs = [*source, "-i", url]
+            if audio:
+                inputs += [*source, "-i", audio, "-map", "0:v:0", "-map", "1:a:0"]
+            with open(DATA / "remux.log", "ab") as errors:
+                self.proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-nostdin", "-loglevel", "error", *inputs,
+                    # The picture is copied as it is. The sound becomes stereo AAC, which every
+                    # Roku plays: many films carry Dolby Digital, which this one refuses.
+                    "-sn", "-dn", "-c:v", "copy", "-c:a", "aac", "-ac", "2", "-b:a", "192k",
+                    "-f", "hls", "-hls_time", "4",
+                    "-hls_list_size", "0", "-hls_playlist_type", "event",
+                    "-hls_segment_filename", str(out / "seg%05d.ts"), str(out / "index.m3u8"),
+                    stdout=asyncio.subprocess.DEVNULL, stderr=errors,
+                    preexec_fn=die_with_parent)
+            log.info("remuxing %s from %.0f s", url[:100], start)
         index = out / "index.m3u8"
         for _ in range(150):
             if index.exists() and index.read_text().count("#EXTINF") >= 2:
@@ -1072,9 +1354,13 @@ class Remuxer:
             await asyncio.sleep(0.2)
         raise web.HTTPGatewayTimeout(text="the stream took too long to start")
 
-    def stop(self):
+    def stop(self, clean=False):
         if self.proc is not None and self.proc.returncode is None:
             self.proc.kill()
+        if clean:
+            # A whole film can be gigabytes; it isn't kept once the TV is done with it.
+            shutil.rmtree(self.dir, ignore_errors=True)
+            self.key = None
 
 
 async def command_output(*args, env=None, timeout=10):

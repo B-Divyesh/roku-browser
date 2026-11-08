@@ -836,6 +836,8 @@ sub playVideo(p as object)
         content.PlayStart = 100000
     end if
     m.mirroring = (p.mirror = true)
+    ' A page's own video: when the player stops, the page picks up where it got to.
+    m.pageVideo = (p.page = true)
     hideNotice()
     m.video.content = content
     m.video.visible = true
@@ -843,9 +845,16 @@ sub playVideo(p as object)
     m.highlight.visible = false
     m.video.setFocus(true)
     m.video.control = "play"
+    if m.pageVideo then showNotice("Back returns to the page")
 end sub
 
-sub stopVideo()
+sub stopVideo(failed = false as boolean)
+    if m.pageVideo
+        m.pageVideo = false
+        failedFlag = 0
+        if failed then failedFlag = 1
+        send("videoend", {pos: Int(m.video.position), failed: failedFlag})
+    end if
     if m.mirroring
         ' Stop capturing now, which also gives the laptop its sound back.
         m.mirroring = false
@@ -866,7 +875,7 @@ sub onVideoState()
     if st = "error"
         print "video error: "; m.video.errorCode; " "; m.video.errorMsg
         mirroring = m.mirroring
-        stopVideo()
+        stopVideo(true)
         if mirroring
             showNotice("The laptop stopped showing its screen")
         else
