@@ -27,6 +27,13 @@ sub init()
     m.scrollId = 0
     m.pendingScrolls = []       ' scrolls sent that the picture on screen doesn't include yet
     m.slideClock = CreateObject("roTimespan")
+    m.bar = m.top.findNode("topbar")
+    m.barIn = m.top.findNode("barIn")
+    m.barOut = m.top.findNode("barOut")
+    m.barOut.observeField("state", "onBarOut")
+    m.barItems = buildBar()
+    m.barShown = false
+    m.barHover = ""
     m.cursor = m.top.findNode("cursor")
     m.highlight = m.top.findNode("highlight")
     m.ring = m.top.findNode("ring")
@@ -327,7 +334,11 @@ sub onState()
         base = key
         if s.base <> invalid and s.base > 0 then base = m.boot + "-" + s.base.toStr()
         if s.links <> invalid then m.pendingLinks[key] = s.links
-        if s.si <> invalid then m.frameScroll[key] = s.si
+        if s.si <> invalid
+            m.frameScroll[key] = s.si
+            ' A scroll that changed nothing still settles the picture on screen.
+            if key = m.shownFrame or key = m.shownPatch then settleSlide(key)
+        end if
         if s.patch <> invalid
             m.wantPatch = {key: key, base: base, rect: s.patch}
         else
@@ -342,6 +353,7 @@ sub onState()
         end if
     end if
     updateChrome(s)
+    if m.barShown then fillBar()
     if s.action <> invalid then runAction(s.action)
 end sub
 
@@ -432,6 +444,15 @@ end sub
 ' page couldn't scroll that far (its end), the real frame simply puts it right.
 function nextScroll(dx as float, dy as float) as integer
     m.scrollId = m.scrollId + 1
+    ' Never slide past the page's top or bottom: there's nothing there to scroll to.
+    if m.state.sy <> invalid and m.state.smax <> invalid
+        y = m.state.sy
+        for each p in m.pendingScrolls
+            y = y + p.dy
+        end for
+        if dy < -y then dy = -y
+        if dy > m.state.smax - y then dy = m.state.smax - y
+    end if
     m.pendingScrolls.Push({id: m.scrollId, dx: dx, dy: dy})
     m.slideClock.Mark()
     m.highlight.visible = false
@@ -471,6 +492,140 @@ sub slideTo(animate as boolean)
     else
         m.pages.translation = [x, y]
     end if
+end sub
+
+' ---- top bar ------------------------------------------------------------
+
+function buildBar() as object
+    specs = [
+        {id: "back", x: 16, w: 56, text: "←"},
+        {id: "forward", x: 80, w: 56, text: "→"},
+        {id: "reload", x: 144, w: 56, text: "↻"},
+        {id: "address", x: 216, w: 812, text: ""},
+        {id: "engine", x: 1040, w: 224, text: ""}
+    ]
+    items = []
+    for each spec in specs
+        g = m.bar.createChild("Group")
+        g.translation = [spec.x, 10]
+        bg = g.createChild("Poster")
+        bg.uri = "pkg:/images/pill.9.png"
+        bg.width = spec.w
+        bg.height = 48
+        bg.blendColor = "0x2B222BFF"
+        label = g.createChild("Label")
+        label.height = 48
+        label.vertAlign = "center"
+        label.color = "0xF0E4D4FF"
+        font = CreateObject("roSGNode", "Font")
+        font.uri = "pkg:/fonts/Inter-Medium.ttf"
+        if spec.w < 60
+            font.size = 26
+            label.width = spec.w
+            label.horizAlign = "center"
+        else
+            font.size = 20
+            label.translation = [20, 0]
+            label.width = spec.w - 40
+            label.horizAlign = "left"
+        end if
+        label.font = font
+        label.text = spec.text
+        items.Push({id: spec.id, x: spec.x, w: spec.w, bg: bg, label: label})
+    end for
+    return items
+end function
+
+' What the bar says: where the page is, and which search engine typed words go to.
+sub fillBar()
+    s = m.state
+    for each item in m.barItems
+        if item.id = "address"
+            text = "Search or type an address"
+            if s.url <> invalid and Left(s.url, 4) = "http" and s.host <> ""
+                text = s.host
+                if s.title <> invalid and s.title <> "" then text = s.host + "  ·  " + s.title
+            end if
+            item.label.text = text
+        else if item.id = "engine"
+            engine = "Brave"
+            if s.engine <> invalid and s.engine <> "" then engine = s.engine
+            item.label.text = "Search: " + engine
+        end if
+        unavailable = (item.id = "back" and s.back <> true) or (item.id = "forward" and s.fwd <> true)
+        if unavailable then item.label.opacity = 0.35 else item.label.opacity = 1
+    end for
+end sub
+
+sub showBar()
+    if m.barShown then return
+    m.barShown = true
+    fillBar()
+    m.highlight.visible = false
+    m.barOut.control = "stop"
+    m.bar.visible = true
+    m.barIn.control = "start"
+    hoverBar()
+end sub
+
+sub hideBar()
+    if not m.barShown then return
+    m.barShown = false
+    m.barHover = ""
+    m.barIn.control = "stop"
+    m.barOut.control = "start"
+end sub
+
+sub onBarOut()
+    if m.barOut.state = "stopped" and not m.barShown then m.bar.visible = false
+end sub
+
+sub hoverBar()
+    hover = ""
+    if m.y <= 70
+        for each item in m.barItems
+            if m.x >= item.x and m.x < item.x + item.w then hover = item.id
+        end for
+    end if
+    if hover = m.barHover then return
+    m.barHover = hover
+    for each item in m.barItems
+        if item.id = hover
+            item.bg.blendColor = "0xE89B5EFF"
+            item.label.color = "0x1A141BFF"
+        else
+            item.bg.blendColor = "0x2B222BFF"
+            item.label.color = "0xF0E4D4FF"
+        end if
+    end for
+end sub
+
+sub barAction(id as string)
+    if id = "back"
+        goBack()
+    else if id = "forward"
+        send("forward")
+    else if id = "reload"
+        send("reload")
+    else if id = "address"
+        hideBar()
+        openAddress()
+    else if id = "engine"
+        hideBar()
+        openEngineMenu()
+    end if
+end sub
+
+sub openEngineMenu()
+    current = "Brave"
+    if m.state.engine <> invalid and m.state.engine <> "" then current = m.state.engine
+    items = []
+    for each name in ["Brave", "DuckDuckGo", "Google", "Bing", "Startpage", "Ecosia", "Yandex"]
+        value = ""
+        if name = current then value = "in use"
+        items.Push({id: "engine:" + name, title: name, value: value})
+    end for
+    showMenu(items, "engine:" + current, "Search engine", "Where words typed in the address go")
 end sub
 
 ' ---- remote -------------------------------------------------------------
@@ -540,6 +695,14 @@ end function
 
 sub placeCursor()
     m.cursor.translation = [m.x - 3, m.y - 3]
+    if m.barShown
+        if m.y > 92
+            hideBar()
+        else
+            hoverBar()
+            return
+        end if
+    end if
     updateHover(true)
 end sub
 
@@ -635,7 +798,11 @@ sub stepCursor()
         nx = 1279
     end if
     if ny < 0
-        m.scrollY = m.scrollY + ny * 2.5
+        if m.barShown
+            m.scrollY = m.scrollY + ny * 2.5
+        else
+            showBar()
+        end if
         ny = 0
     else if ny > 719
         m.scrollY = m.scrollY + (ny - 719) * 2.5
@@ -664,6 +831,10 @@ sub sendMove()
 end sub
 
 sub click()
+    if m.barShown and m.y <= 70
+        barAction(m.barHover)
+        return
+    end if
     m.ring.translation = [m.x - 48, m.y - 48]
     m.anim.clickAnim.control = "start"
     flushScroll()
@@ -872,6 +1043,14 @@ end sub
 
 sub onMenuSelect()
     id = m.menuItems[m.menuList.itemSelected].id
+    if Left(id, 7) = "engine:"
+        closeMenu()
+        name = Mid(id, 8)
+        m.state.engine = name
+        send("engine", {name: name})
+        showNotice("Searches now use " + name)
+        return
+    end if
     if id = "mirror"
         closeMenu()
         startMirror()

@@ -23,6 +23,13 @@
     <!-- Lite mode: pages fetched and drawn by the Roku itself, when there's no laptop. -->
     <LiteView id="lite" visible="false"/>
 
+    <!-- The top bar: back, forward, reload, the address and the search engine. It drops
+         down when the cursor reaches the top edge; its items are built in code. -->
+    <Group id="topbar" translation="[0, -76]" visible="false">
+      <Rectangle width="1280" height="68" color="0x1A141BF7"/>
+      <Rectangle width="1280" height="1" translation="[0, 68]" color="0x3B2F3AFF"/>
+    </Group>
+
     <Rectangle id="progress" width="260" height="3" translation="[-260, 0]" color="0xE89B5EFF" visible="false"/>
 
     <Poster id="ring" uri="pkg:/images/ring.png" width="96" height="96" scaleRotateCenter="[48, 48]"
@@ -87,6 +94,12 @@
     <Timer id="fallbackTimer" duration="5"/>
     <Timer id="lostTimer" duration="6"/>
 
+    <Animation id="barIn" duration="0.16" easeFunction="outCubic">
+      <Vector2DFieldInterpolator key="[0, 1]" keyValue="[[0, -76], [0, 0]]" fieldToInterp="topbar.translation"/>
+    </Animation>
+    <Animation id="barOut" duration="0.14" easeFunction="inCubic">
+      <Vector2DFieldInterpolator key="[0, 1]" keyValue="[[0, 0], [0, -76]]" fieldToInterp="topbar.translation"/>
+    </Animation>
     <Animation id="slide" duration="0.14" easeFunction="outCubic">
       <Vector2DFieldInterpolator id="slideTo" key="[0, 1]" keyValue="[[0, 0], [0, 0]]" fieldToInterp="pages.translation"/>
     </Animation>

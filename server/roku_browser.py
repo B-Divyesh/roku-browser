@@ -42,6 +42,16 @@ DEFAULTS = {
     "idle_close_minutes": 15,
     "browser": "",              # empty: the first of BROWSERS that's installed
 }
+# Where words typed in the address bar go; chosen from the TV's top bar.
+ENGINES = {
+    "Brave": "https://search.brave.com/search?q={}",
+    "DuckDuckGo": "https://duckduckgo.com/?q={}",
+    "Google": "https://www.google.com/search?q={}",
+    "Bing": "https://www.bing.com/search?q={}",
+    "Startpage": "https://www.startpage.com/do/search?query={}",
+    "Ecosia": "https://www.ecosia.org/search?q={}",
+    "Yandex": "https://yandex.com/search/?text={}",
+}
 BROWSERS = ("brave", "brave-browser", "chromium", "chromium-browser", "google-chrome-stable", "google-chrome")
 W, H = 1280, 720
 CAPTURE_INTERVAL = 0.15         # seconds between full-size captures
@@ -87,7 +97,8 @@ CLICKABLE_JS = r"""(() => {
     out.push([r.left, r.top, r.width, r.height]);
     if (out.length >= 300) break;
   }
-  return out;
+  const doc = document.scrollingElement || document.documentElement;
+  return {links: out, y: doc.scrollTop, max: Math.max(0, doc.scrollHeight - innerHeight)};
 })()"""
 
 # Runs in every page and frame: reports a video or audio element starting to play, so its
@@ -226,6 +237,21 @@ def load_config():
     if not cfg["browser"]:
         raise SystemExit("No Chromium-based browser found; install Brave, Chromium or Google Chrome.")
     return cfg
+
+
+def save_setting(key, value):
+    """Changes one setting in config.json, which stays private: it also holds the
+    developer password."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except (FileNotFoundError, ValueError):
+        data = {}
+    data[key] = value
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
 
 
 def local_ip_for(remote):
@@ -428,6 +454,7 @@ class Browser:
         self.base_no = 0                # frame number of the TV's current full picture
         self.patch = None               # (x, y, w, h) of the current frame's patch, if it's one
         self.scroll_id = 0              # the TV numbers its scrolls; the last one dispatched
+        self.scroll_y = (0, 0)          # (position, furthest) of the page's scroll, in TV pixels
         self.frame_scroll = 0           # ...and the last one the current frame includes
         self.last_input = 0.0           # scrolling, typing: frames go out fast meanwhile
         self.png = b""
@@ -855,6 +882,14 @@ class Browser:
                     break
                 self.last_capture = time.monotonic()
                 png = base64.b64decode(r["data"])
+                found = links.get("result", {}).get("value") or {}
+                z = self.zoom
+                self.scroll_y = (round(found.get("y", 0) * z), round(found.get("max", 0) * z))
+                if png == self.png and scrolled != self.frame_scroll:
+                    # A scroll that changed nothing (the page's end): the TV still has to
+                    # hear it's done, or it keeps the picture slid.
+                    self.frame_scroll = scrolled
+                    self.bump()
                 if png != self.png:
                     self.png = png
                     fast = time.monotonic() - self.last_input < 0.6
@@ -870,9 +905,7 @@ class Browser:
                             asyncio.create_task(self._sharpen_later())
                     else:
                         self.patch = self.coder.patches[self.frame_no][0]
-                    z = self.zoom
-                    self.links = [[round(v * z) for v in rect]
-                                  for rect in links.get("result", {}).get("value") or []]
+                    self.links = [[round(v * z) for v in rect] for rect in found.get("links", [])]
                     log.debug("frame %d captured (%s)", self.frame_no, kind)
                     await self._wake()
         finally:
@@ -912,6 +945,7 @@ class Browser:
         label = "  ·  ".join(x for x in (title, host) if x) or "Loading…"
         s = {
             "frame": self.frame_no, "base": self.base_no, "si": self.frame_scroll,
+            "sy": self.scroll_y[0], "smax": self.scroll_y[1],
             "sv": self.state_ver, "boot": self.boot,
             "url": url, "title": title, "host": host, "label": label,
             "loading": tid in self.loading,
@@ -919,6 +953,7 @@ class Browser:
             "fwd": self._history_step(1) is not None,
             "tabs": len(self.tabs), "zoom": round(self.zoom * 100),
             "video": self._video_label(),
+            "engine": next((k for k, v in ENGINES.items() if v == self.cfg["search"]), "Custom"),
         }
         if self.patch:
             s["patch"] = list(self.patch)
@@ -1121,6 +1156,11 @@ class Browser:
             await self.go_forward()
         elif t == "reload":
             await self.page("Page.reload", {})
+        elif t == "engine":
+            if q.get("name") in ENGINES:
+                self.cfg["search"] = ENGINES[q["name"]]
+                save_setting("search", self.cfg["search"])
+                self.bump()
         elif t == "zoom":
             i = ZOOMS.index(min(ZOOMS, key=lambda z: abs(z - self.zoom)))
             await self.set_zoom(ZOOMS[(i + 1) % len(ZOOMS)])
