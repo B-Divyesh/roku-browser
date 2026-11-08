@@ -10,9 +10,15 @@
   <children>
     <Rectangle id="bg" width="1280" height="720" color="0x1A141BFF"/>
 
-    <!-- Two page layers: the next frame loads into the hidden one, then they swap. -->
-    <Poster id="pageA" width="1280" height="720" opacity="0"/>
-    <Poster id="pageB" width="1280" height="720" opacity="0"/>
+    <!-- Two page layers: the next frame loads into the hidden one, then they swap. Above
+         them, the rectangle that changed since (a patch), double-buffered the same way.
+         The group slides at once when scrolling, before the scrolled frame arrives. -->
+    <Group id="pages">
+      <Poster id="pageA" width="1280" height="720" opacity="0"/>
+      <Poster id="pageB" width="1280" height="720" opacity="0"/>
+      <Poster id="patchA" visible="false"/>
+      <Poster id="patchB" visible="false"/>
+    </Group>
 
     <!-- Lite mode: pages fetched and drawn by the Roku itself, when there's no laptop. -->
     <LiteView id="lite" visible="false"/>
@@ -81,6 +87,9 @@
     <Timer id="fallbackTimer" duration="5"/>
     <Timer id="lostTimer" duration="6"/>
 
+    <Animation id="slide" duration="0.14" easeFunction="outCubic">
+      <Vector2DFieldInterpolator id="slideTo" key="[0, 1]" keyValue="[[0, 0], [0, 0]]" fieldToInterp="pages.translation"/>
+    </Animation>
     <Animation id="toastIn" duration="0.2" easeFunction="outQuad">
       <FloatFieldInterpolator key="[0, 1]" keyValue="[0, 1]" fieldToInterp="toast.opacity"/>
     </Animation>

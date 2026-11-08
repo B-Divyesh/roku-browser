@@ -11,6 +11,22 @@ sub init()
     m.back = m.top.findNode("pageB")
     m.front.observeField("loadStatus", "onPageLoad")
     m.back.observeField("loadStatus", "onPageLoad")
+    ' What changed since the full picture, laid on top of it (see FrameCoder on the laptop).
+    m.patchFront = m.top.findNode("patchA")
+    m.patchBack = m.top.findNode("patchB")
+    m.patchFront.observeField("loadStatus", "onPatchLoad")
+    m.patchBack.observeField("loadStatus", "onPatchLoad")
+    m.wantPatch = invalid
+    m.patchLoading = ""
+    m.shownPatch = ""
+    ' Scrolling slides the picture at once; a frame that includes the scroll settles it.
+    m.pages = m.top.findNode("pages")
+    m.slide = m.top.findNode("slide")
+    m.slideTo = m.top.findNode("slideTo")
+    m.frameScroll = {}          ' frame -> the last scroll it includes
+    m.scrollId = 0
+    m.pendingScrolls = []       ' scrolls sent that the picture on screen doesn't include yet
+    m.slideClock = CreateObject("roTimespan")
     m.cursor = m.top.findNode("cursor")
     m.highlight = m.top.findNode("highlight")
     m.ring = m.top.findNode("ring")
@@ -308,10 +324,21 @@ sub onState()
     if s.boot <> invalid then m.boot = s.boot
     if s.frame > 0
         key = m.boot + "-" + s.frame.toStr()
-        if key <> m.shownFrame
-            m.wantFrame = key
-            if s.links <> invalid then m.pendingLinks[key] = s.links
+        base = key
+        if s.base <> invalid and s.base > 0 then base = m.boot + "-" + s.base.toStr()
+        if s.links <> invalid then m.pendingLinks[key] = s.links
+        if s.si <> invalid then m.frameScroll[key] = s.si
+        if s.patch <> invalid
+            m.wantPatch = {key: key, base: base, rect: s.patch}
+        else
+            m.wantPatch = invalid
+            if base = m.shownFrame then hidePatch()     ' back to the full picture itself
+        end if
+        if base <> m.shownFrame
+            m.wantFrame = base
             loadNext()
+        else
+            loadPatch()
         end if
     end if
     updateChrome(s)
@@ -339,18 +366,110 @@ sub onPageLoad(event as object)
         m.back = old
         m.shownFrame = m.loadingFrame
         m.loadingFrame = ""
+        hidePatch()                 ' patches belong to the picture before
         ' Click targets travel with their frame, so they match what's on screen.
         if m.pendingLinks.doesExist(m.shownFrame)
             m.links = m.pendingLinks[m.shownFrame]
             updateHover(false)
         end if
-        keep = m.pendingLinks[m.wantFrame]
-        m.pendingLinks = {}
-        if keep <> invalid then m.pendingLinks[m.wantFrame] = keep
+        settleSlide(m.shownFrame)
+        keepLinks = {}
+        for each k in m.pendingLinks
+            if k = m.wantFrame or (m.wantPatch <> invalid and k = m.wantPatch.key) then keepLinks[k] = m.pendingLinks[k]
+        end for
+        m.pendingLinks = keepLinks
         loadNext()
+        loadPatch()
     else if status = "failed"
         m.back.uri = ""
         m.loadingFrame = ""
+    end if
+end sub
+
+' A patch: the rectangle that changed since the full picture now showing.
+sub loadPatch()
+    p = m.wantPatch
+    if p = invalid or p.base <> m.shownFrame or m.patchLoading <> "" or p.key = m.shownPatch then return
+    m.patchLoading = p.key
+    m.patchBase = p.base
+    m.patchBack.translation = [p.rect[0], p.rect[1]]
+    m.patchBack.width = p.rect[2]
+    m.patchBack.height = p.rect[3]
+    m.patchBack.uri = m.server + "/patch/" + p.key + ".jpg"
+end sub
+
+sub onPatchLoad(event as object)
+    node = event.getRoSGNode()
+    status = event.getData()
+    if not node.isSameNode(m.patchBack) or m.patchLoading = "" then return
+    if status = "ready" and m.patchBase = m.shownFrame
+        m.patchBack.visible = true
+        m.patchFront.visible = false
+        old = m.patchFront
+        m.patchFront = m.patchBack
+        m.patchBack = old
+        m.shownPatch = m.patchLoading
+        if m.pendingLinks.doesExist(m.shownPatch)
+            m.links = m.pendingLinks[m.shownPatch]
+            updateHover(false)
+        end if
+        settleSlide(m.shownPatch)
+    else if status <> "ready" and status <> "failed"
+        return                          ' still loading
+    end if
+    m.patchLoading = ""
+    loadPatch()
+end sub
+
+sub hidePatch()
+    m.patchFront.visible = false
+    m.patchBack.visible = false
+    m.shownPatch = ""
+end sub
+
+' Scrolling: the picture slides at once, natively on the Roku, by every scroll the frame
+' on screen doesn't include yet; each frame from the laptop says which it includes. If the
+' page couldn't scroll that far (its end), the real frame simply puts it right.
+function nextScroll(dx as float, dy as float) as integer
+    m.scrollId = m.scrollId + 1
+    m.pendingScrolls.Push({id: m.scrollId, dx: dx, dy: dy})
+    m.slideClock.Mark()
+    m.highlight.visible = false
+    slideTo(true)
+    return m.scrollId
+end function
+
+' A new frame on screen: drop the scrolls it includes, slide by the rest.
+sub settleSlide(key as string)
+    if m.pendingScrolls.Count() = 0 then return
+    si = m.frameScroll[key]
+    if m.slideClock.TotalMilliseconds() > 2500
+        m.pendingScrolls = []           ' scrolls the laptop never answered
+    else if si <> invalid
+        rest = []
+        for each p in m.pendingScrolls
+            if p.id > si then rest.Push(p)
+        end for
+        m.pendingScrolls = rest
+    end if
+    slideTo(false)
+end sub
+
+sub slideTo(animate as boolean)
+    x = 0
+    y = 0
+    for each p in m.pendingScrolls
+        x = x - p.dx
+        y = y - p.dy
+    end for
+    if y > 720 then y = 720
+    if y < -720 then y = -720
+    m.slide.control = "stop"
+    if animate
+        m.slideTo.keyValue = [m.pages.translation, [x, y]]
+        m.slide.control = "start"
+    else
+        m.pages.translation = [x, y]
     end if
 end sub
 
@@ -407,9 +526,10 @@ function onKeyEvent(key as string, press as boolean) as boolean
     else if key = "options"
         openMenu()
     else if key = "rewind"
-        send("page", {dir: -1})
+        ' The laptop pages by 85% of the screen.
+        send("page", {dir: -1, sid: nextScroll(0, -612)})
     else if key = "fastforward"
-        send("page", {dir: 1})
+        send("page", {dir: 1, sid: nextScroll(0, 612)})
     else if key = "replay"
         send("reload")
     else
@@ -531,7 +651,8 @@ end sub
 
 sub flushScroll()
     if m.scrollX = 0 and m.scrollY = 0 then return
-    send("scroll", {x: Int(m.x), y: Int(m.y), dx: Int(m.scrollX), dy: Int(m.scrollY)})
+    sid = nextScroll(Int(m.scrollX), Int(m.scrollY))
+    send("scroll", {x: Int(m.x), y: Int(m.y), dx: Int(m.scrollX), dy: Int(m.scrollY), sid: sid})
     m.scrollX = 0
     m.scrollY = 0
     m.lastScroll = m.clock.TotalMilliseconds()

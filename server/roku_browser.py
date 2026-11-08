@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, quote, urljoin, urlparse
 import aiohttp
 import yarl
 from aiohttp import web
-from PIL import Image
+from PIL import Image, ImageChops
 
 CONFIG_PATH = Path.home() / ".config/roku/config.json"
 DATA = Path.home() / ".local/share/roku-browser"
@@ -251,10 +251,66 @@ def shrink_image(data, width):
         return out.getvalue(), "image/jpeg"
 
 
-def to_jpeg(png):
-    with Image.open(io.BytesIO(png)) as im:
+class FrameCoder:
+    """Turns screenshots into what the TV loads: a full picture (the base), or just the
+    rectangle that changed since the base (a patch) when that's small, so a hovered link
+    or a typed letter costs the Roku a few kilobytes instead of a whole screen. While the
+    page is moving, bases go out quickly at lower quality; once it rests, sharpen() sends
+    the same picture again at full quality, so text being read stays crisp.
+
+    Patches are always against the base, never against each other, so the TV can skip
+    any number of frames and still only ever needs the base plus the latest patch."""
+
+    PATCH_AREA = 0.3                # beyond this share of the screen, a new base is quicker
+    KEEP = 4                        # recent frames kept, so a request for one finds it
+
+    def __init__(self):
+        self.base = None            # (frame number, image) the TV is building on
+        self.sharp = True           # the base went out at full quality
+        self.latest = None          # the newest screenshot, decoded
+        self.bases = {}             # frame number -> JPEG
+        self.patches = {}           # frame number -> ((x, y, w, h), JPEG)
+
+    def add(self, png, n, fast):
+        """Takes screenshot number n. Returns "base", "patch", or None if nothing changed."""
+        img = Image.open(io.BytesIO(png)).convert("RGB")
+        self.latest = img
+        if self.base is not None and self.base[1].size == img.size:
+            box = ImageChops.difference(self.base[1], img).getbbox()
+            if box is None:
+                return "base"           # back to exactly the base: the patch goes
+            x0, y0 = box[0] // 16 * 16, box[1] // 16 * 16
+            x1, y1 = min(img.width, -(-box[2] // 16) * 16), min(img.height, -(-box[3] // 16) * 16)
+            if (x1 - x0) * (y1 - y0) <= self.PATCH_AREA * img.width * img.height:
+                self._keep(self.patches, n, ((x0, y0, x1 - x0, y1 - y0),
+                                             self._jpeg(img.crop((x0, y0, x1, y1)), sharp=True)))
+                return "patch"
+        self._set_base(n, img, sharp=not fast)
+        return "base"
+
+    def sharpen(self, n):
+        """The resting page as a full-quality base, if the last one went out fast."""
+        if self.sharp or self.latest is None:
+            return False
+        self._set_base(n, self.latest, sharp=True)
+        return True
+
+    def _set_base(self, n, img, sharp):
+        self.base, self.sharp = (n, img), sharp
+        self._keep(self.bases, n, self._jpeg(img, sharp))
+
+    def _keep(self, store, n, item):
+        store[n] = item
+        while len(store) > self.KEEP:
+            store.pop(next(iter(store)))
+
+    @staticmethod
+    def _jpeg(img, sharp):
         out = io.BytesIO()
-        im.convert("RGB").save(out, "JPEG", quality=JPEG_QUALITY, subsampling=0)
+        if sharp:   # full colour detail, so coloured text stays crisp
+            img.save(out, "JPEG", quality=JPEG_QUALITY, subsampling=0)
+        else:       # about a third the time and size, for pictures on screen a moment
+            img.save(out, "JPEG", quality=72, subsampling=2)
         return out.getvalue()
 
 
@@ -368,7 +424,12 @@ class Browser:
         self.no_handoff = set()         # streams the TV's player couldn't play
         self.loading = set()
         self.frame_no = 0
-        self.jpeg = b""
+        self.coder = FrameCoder()
+        self.base_no = 0                # frame number of the TV's current full picture
+        self.patch = None               # (x, y, w, h) of the current frame's patch, if it's one
+        self.scroll_id = 0              # the TV numbers its scrolls; the last one dispatched
+        self.frame_scroll = 0           # ...and the last one the current frame includes
+        self.last_input = 0.0           # scrolling, typing: frames go out fast meanwhile
         self.png = b""
         self.links = []                 # clickable rects for the current frame, in 1280x720 coordinates
         self.state_ver = 0
@@ -783,6 +844,7 @@ class Browser:
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self.dirty = False
+                scrolled = self.scroll_id
                 try:
                     links = await self.page("Runtime.evaluate", {"expression": CLICKABLE_JS, "returnByValue": True})
                     async with self.shot_lock:
@@ -795,15 +857,36 @@ class Browser:
                 png = base64.b64decode(r["data"])
                 if png != self.png:
                     self.png = png
-                    self.jpeg = await asyncio.to_thread(to_jpeg, png)
+                    fast = time.monotonic() - self.last_input < 0.6
+                    kind = await asyncio.to_thread(self.coder.add, png, self.frame_no + 1, fast)
+                    if kind is None:
+                        continue
+                    self.frame_no += 1
+                    self.frame_scroll = scrolled
+                    if kind == "base":
+                        self.base_no = self.coder.base[0]
+                        self.patch = None
+                        if fast:
+                            asyncio.create_task(self._sharpen_later())
+                    else:
+                        self.patch = self.coder.patches[self.frame_no][0]
                     z = self.zoom
                     self.links = [[round(v * z) for v in rect]
                                   for rect in links.get("result", {}).get("value") or []]
-                    self.frame_no += 1
-                    log.debug("frame %d captured", self.frame_no)
+                    log.debug("frame %d captured (%s)", self.frame_no, kind)
                     await self._wake()
         finally:
             self.capturing = False
+
+    async def _sharpen_later(self):
+        """Once the page has rested a moment, send it again at full quality."""
+        await asyncio.sleep(0.7)
+        if time.monotonic() - self.last_input < 0.6 or self.capturing:
+            return                      # still moving; a later frame will try again
+        if await asyncio.to_thread(self.coder.sharpen, self.frame_no + 1):
+            self.frame_no += 1
+            self.base_no, self.patch = self.frame_no, None
+            await self._wake()
 
     async def _wake(self):
         async with self.changed:
@@ -828,7 +911,8 @@ class Browser:
             title = ""
         label = "  ·  ".join(x for x in (title, host) if x) or "Loading…"
         s = {
-            "frame": self.frame_no, "sv": self.state_ver, "boot": self.boot,
+            "frame": self.frame_no, "base": self.base_no, "si": self.frame_scroll,
+            "sv": self.state_ver, "boot": self.boot,
             "url": url, "title": title, "host": host, "label": label,
             "loading": tid in self.loading,
             "back": self._history_step(-1) is not None or len(self.tabs) > 1,
@@ -836,6 +920,8 @@ class Browser:
             "tabs": len(self.tabs), "zoom": round(self.zoom * 100),
             "video": self._video_label(),
         }
+        if self.patch:
+            s["patch"] = list(self.patch)
         if take_action and self.action:
             s["action"], self.action = self.action, None
         return s
@@ -990,6 +1076,8 @@ class Browser:
         log.debug("input %s", t)
         if t != "move":
             self.recapture()
+        if t in ("scroll", "page", "key", "text", "click", "nav"):
+            self.last_input = time.monotonic()
         if t == "move":
             async with self.pointer():
                 await self.mouse("mouseMoved", self.css(q, "x"), self.css(q, "y"))
@@ -1010,11 +1098,13 @@ class Browser:
             async with self.pointer():
                 await self.mouse("mouseWheel", self.css(q, "x"), self.css(q, "y"),
                                  deltaX=self.css(q, "dx"), deltaY=self.css(q, "dy"))
+            self.scroll_id = int(q.get("sid") or self.scroll_id)
             self.mark_dirty()
         elif t == "page":
             async with self.pointer():
                 await self.mouse("mouseWheel", W / self.zoom / 2, H / self.zoom / 2, deltaX=0,
                                  deltaY=int(q.get("dir", 1)) * H / self.zoom * 0.85)
+            self.scroll_id = int(q.get("sid") or self.scroll_id)
             self.mark_dirty()
         elif t == "text":
             await self.type_text(q.get("s", ""), enter=q.get("enter") == "1", replace=q.get("replace", "1") == "1")
@@ -1888,9 +1978,24 @@ def make_app(b):
         page = START_HTML.replace("%TILES%", tiles).replace("%SEARCH%", json.dumps(b.cfg["search"]))
         return web.Response(text=page, content_type="text/html")
 
+    def frame_number(req):
+        try:
+            return int(req.match_info["n"].rsplit("-", 1)[-1])
+        except ValueError:
+            raise web.HTTPNotFound()
+
     async def frame(req):
-        log.debug("frame %s served", req.match_info["n"])
-        return web.Response(body=b.jpeg, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+        """A full picture: the one asked for if it's still kept, else the newest."""
+        n = frame_number(req)
+        body = b.coder.bases.get(n) or (b.coder.bases[max(b.coder.bases)] if b.coder.bases else b"")
+        return web.Response(body=body, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+    async def patch(req):
+        """A changed rectangle; only the exact one will do, since it's placed by position."""
+        item = b.coder.patches.get(frame_number(req))
+        if item is None:
+            raise web.HTTPNotFound()
+        return web.Response(body=item[1], content_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
     async def input_(req):
         if req.query.get("t") == "mirror":
@@ -2089,6 +2194,7 @@ def make_app(b):
     app = web.Application(middlewares=[guard])
     app.add_routes([
         web.get("/hello", hello), web.get("/start", start), web.get("/poll", poll), web.get(r"/frame/{n}.jpg", frame),
+        web.get(r"/patch/{n}.jpg", patch),
         web.get("/input", input_), web.get("/state", state), web.post("/open", open_),
         web.post("/type", type_), web.post("/cast", cast), web.get("/file/{token}/{name}", file),
         web.get("/remux", remux), web.get("/remux/{key}/{name}", remux_file),
