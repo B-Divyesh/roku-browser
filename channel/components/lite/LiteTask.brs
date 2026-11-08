@@ -98,13 +98,13 @@ function load(req as object) as object
 
     t = CreateObject("roTimespan")
     resp = http(url, req.post)
-    fetchMs = t.TotalMilliseconds()
-    if resp.code < 200 or resp.code >= 400
-        reason = resp.error
-        if resp.code > 0 then reason = "The site answered with error " + resp.code.toStr() + "."
-        if reason = "" or reason = invalid then reason = "Check the address, or try again."
-        return {doc: messageDoc(url, "Couldn't open this page", reason)}
+    if resp.code <= 0 and req.post = invalid and resp.error <> "the site took too long to answer"
+        ' Usually a kept-alive connection the site had already closed: once more, fresh.
+        m.http = newTransfer()
+        resp = http(url, req.post)
     end if
+    fetchMs = t.TotalMilliseconds()
+    if resp.code < 200 or resp.code >= 400 then return {doc: failureDoc(url, resp)}
     ctype = resp.headers["content-type"]
     if ctype = invalid then ctype = ""
     ctype = LCase(ctype)
@@ -133,6 +133,22 @@ function load(req as object) as object
         doc.blocks.Push({k: "caption", r: [{s: note, a: -1, b: false, o: 0}], t: note})
     end if
     return {doc: doc}
+end function
+
+function failureDoc(url as string, resp as object) as object
+    code = resp.code
+    if code = 401 or code = 403
+        return messageDoc(url, "This site doesn't let Lite mode in", "It only answers full browsers. Use the full browser with your laptop, or pick another site.")
+    else if code = 404
+        return messageDoc(url, "Page not found", "The site says this page doesn't exist. Check the address.")
+    else if code = 429
+        return messageDoc(url, "The site is busy", "It's had too many requests. Try again in a minute.")
+    else if code >= 500
+        return messageDoc(url, "The site has a problem", "It answered with error " + code.toStr() + ". Try again later.")
+    end if
+    reason = resp.error
+    if reason = invalid or reason = "" then reason = "Check the address and that the Roku is online, then try again."
+    return messageDoc(url, "Couldn't open this page", reason)
 end function
 
 function messageDoc(url as string, title as string, text as string) as object

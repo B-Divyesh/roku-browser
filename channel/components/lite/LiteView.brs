@@ -859,6 +859,11 @@ function absY(f as object) as float
     return m.pos[f.b].y + f.ry
 end function
 
+function linkUrl(f as object) as string
+    if f.link = invalid or f.link < 0 then return ""
+    return m.doc.links[f.link].u
+end function
+
 function firstVisibleFocusable() as integer
     for i = 0 to m.focusables.Count() - 1
         y = absY(m.focusables[i])
@@ -929,11 +934,16 @@ sub moveVertical(dir as integer)
         refX = 640
         if dir > 0 then refY = viewTop + 30 else refY = viewBottom - 30
     end if
+    ' Links to where the focused one already goes (a result's title, address and
+    ' snippet; a story's headline and photo) are skipped: one press per destination.
+    here = ""
+    if cur <> invalid then here = linkUrl(cur)
     best = -1
     bestScore = 1000000
     for i = 0 to m.focusables.Count() - 1
         f = m.focusables[i]
         dy = (absY(f) - refY) * dir
+        if dy > 8 and here <> "" and linkUrl(f) = here then dy = 0
         if dy > 8
             dx = Abs(absX(f) + f.w / 2 - refX)
             score = dy + dx * 0.3
