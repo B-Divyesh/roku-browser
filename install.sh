@@ -82,13 +82,17 @@ name="$(xml friendly-device-name "$info") ($(xml model-name "$info"), Roku OS $(
 echo "    $name at $roku_ip"
 cfg_set roku "$roku_ip"
 
-# ---- 3. the two Roku settings ----------------------------------------------
+# ---- 3. the Roku's software and its two settings ---------------------------
+version=$(xml software-version "$info")
+if [ -n "$version" ] && [ "${version%%.*}" -lt 10 ]; then
+    fail "This Roku runs Roku OS $version; the Browser app needs Roku OS 10 or newer. Update it under Settings > System > System update > Check now."
+fi
 mode=$(xml ecp-setting-mode "$info")
 if [ "$mode" = "limited" ] || [ "$mode" = "disabled" ]; then
     fail "The Roku only allows limited network control. On the Roku open Settings > System > Advanced system settings > Control by mobile apps > Network access, choose Enabled, then run this again."
 fi
 if [ "$(xml developer-enabled "$info")" != "true" ]; then
-    fail "Developer mode is off. On the Roku remote press Home 3 times, Up 2 times, then Right, Left, Right, Left, Right, and follow README.md step 3. Then run this again."
+    fail "Developer mode is off. On the Roku remote press Home 3 times, Up 2 times, then Right, Left, Right, Left, Right, and follow README.md step 4. Then run this again."
 fi
 
 dev_ok() {

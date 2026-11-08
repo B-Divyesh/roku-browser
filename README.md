@@ -22,7 +22,7 @@ Everything stays on your home network; nothing goes through a third-party server
 
 ## What you need
 
-- A Roku player or Roku TV on current software (developed on a Roku Streaming Stick, Roku OS 15).
+- A Roku player or Roku TV with Roku OS 10 or newer (see step 1).
 - A Linux laptop or desktop with systemd, on **the same Wi-Fi** as the Roku. Some guest
   networks stop devices from seeing each other; use one that doesn't.
 - On the laptop: Python 3.9+, `aiohttp`, Pillow, `curl`, and Brave, Chromium or Google Chrome.
@@ -31,29 +31,63 @@ The laptop does the browsing, so it needs to be awake while you use the Browser 
 
 ## Setup from scratch
 
-### 1. Set up the Roku
+There are two parts. First the Roku needs one setting changed and developer mode switched
+on (steps 1 to 4, all done with the remote). Then a single command on the laptop installs
+everything else (step 5).
+
+### 1. Check your Roku
+
+Any current Roku works: Roku Express, Streaming Stick and Ultra players, and TVs with Roku
+built in (Roku, TCL, Hisense, Sharp and others). It needs **Roku OS 10 or newer**.
+
+To check, open **Settings → System → About** on the Roku. It shows the model (for example
+*Roku Streaming Stick, 3840EU*) and the *Software version* (for example *15.3.4*). If the
+software is older than 10, update it: **Settings → System → System update → Check now**.
+
+This was developed and tested on a Roku Streaming Stick 3840EU running Roku OS 15.3.4. That
+stick draws its interface at 720p, so pages are sent at 1280×720, a perfect pixel match. A Roku
+with a 1080p interface automatically gets 1920×1080 frames instead. Videos sent to the Roku's
+own player always play at full resolution.
+
+### 2. Set up the Roku
 
 Plug it in, connect it to your Wi-Fi and finish Roku's own setup (it asks you to sign in to
 a Roku account). Use the same Wi-Fi network as your laptop.
 
-### 2. Let the laptop control the Roku
+### 3. Let the laptop control the Roku
 
 On the Roku: **Settings → System → Advanced system settings → Control by mobile apps →
 Network access → Enabled**.
 
 This is the same setting the official Roku phone app needs. *Limited* isn't enough.
 
-### 3. Turn on developer mode
+### 4. Turn on developer mode
 
-This lets you install your own apps on the Roku. It's free and built in.
+Developer mode is Roku's own built-in way to install apps that aren't in the Roku Channel
+Store (Roku calls it *sideloading*). It's free, needs no developer account, and changes nothing
+else on the Roku. You can switch it off again at any time.
 
-1. On the Roku remote press **Home ×3, Up ×2, Right, Left, Right, Left, Right**.
-2. The *Developer settings* screen opens. Note the IP address it shows.
-3. Choose **Enable installer and restart**, accept the agreement, and **set a password**.
-   That's the developer password. The username is always `rokudev`.
-4. The Roku restarts.
+1. Go to the Roku **home screen**.
+2. On the remote, press these buttons in order at a steady pace:
+   **Home, Home, Home, Up, Up, Right, Left, Right, Left, Right**.
+   If nothing happens, press Home, wait for the home screen, and try again a little slower.
+3. The **Developer Settings** screen opens and shows the Roku's address, such as
+   `http://192.168.1.50`. Write it down.
+4. Select **Enable installer and restart**.
+5. The **Developer Tools License Agreement** appears. Scroll to the bottom and select **I Agree**.
+6. You're asked for a **development webserver password**. Choose one (you'll type it again in
+   step 5) and select **Set password and reboot**.
+7. The Roku restarts, which takes about a minute.
 
-### 4. Install on the laptop
+To check it worked, open that address in a web browser on your laptop. A login box
+appears: the username is **rokudev** and the password is the one you just chose. Behind it
+is the Roku's **Development Application Installer** page, saying *No Development Application
+Installed*. You don't need to do anything there; step 5 uses it for you.
+
+To switch developer mode off later, enter the same button sequence and choose **Disable
+installer and restart**. That also removes the Browser app.
+
+### 5. Install on the laptop
 
 Install the requirements:
 
@@ -114,6 +148,25 @@ most distributions already have that on your `PATH`.
 After this, the *Browser* app is on the Roku home screen. You can delete the cloned folder;
 run `./install.sh` again from a fresh clone to update.
 
+### Installing the Roku app by hand (optional)
+
+`install.sh` puts the app on the Roku for you. To do that part yourself instead (for example,
+to see exactly what goes onto the Roku):
+
+1. Download **roku-browser-app.zip** from the
+   [latest release](https://github.com/B-Divyesh/roku-browser/releases/latest). Don't unzip it.
+2. On the laptop, open the Roku's address from step 4 in a web browser and log in as
+   **rokudev** with your developer password.
+3. On the **Development Application Installer** page, next to **File:** click the file button
+   (*Browse…* or *Choose File*, depending on your browser) and pick `roku-browser-app.zip`.
+4. Click **Install with zip**. If an older version is already there, the button says
+   **Replace with zip**.
+5. The page shows *Install Success* and the Browser app opens on the TV. It shows *Looking
+   for your laptop* until the laptop service is running (step 5 sets that up); then it
+   connects by itself.
+
+The app appears at the end of the Roku home screen's app list as **Browser**.
+
 ## Using it
 
 | Remote button | Does |
@@ -150,7 +203,7 @@ most video sites in the Roku's player.
 - **The TV says "Looking for your laptop".** The laptop must be awake, on the same network,
   and running the service: `systemctl --user status roku-browser`. If a firewall is on, open
   8765/tcp and 8766/udp.
-- **"The Roku refused that"** from `roku`: set *Control by mobile apps* to *Enabled* (step 2).
+- **"The Roku refused that"** from `roku`: set *Control by mobile apps* to *Enabled* (step 3).
 - **Google asks you to prove you're human.** Google often flags browsers it can't see
   directly. Searches use Brave Search by default, which doesn't. To change the search
   engine or start page, add `"search": "https://duckduckgo.com/?q={}"` or
@@ -158,7 +211,7 @@ most video sites in the Roku's player.
 - **Netflix, iPlayer, Prime Video** use DRM and won't play inside the browser. Use their
   Roku apps (`roku launch iplayer`).
 - **The Browser app disappeared.** Turning developer mode off removes it. Turn it back on
-  and run `./install.sh` again. Developer mode allows one sideloaded app at a time.
+  (step 4) and run `./install.sh` again. Developer mode allows one sideloaded app at a time.
 - Logs: `journalctl --user -u roku-browser -f` on the laptop, `roku console` for the Roku app.
 
 ## Privacy and security
