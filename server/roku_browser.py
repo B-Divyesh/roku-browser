@@ -267,6 +267,7 @@ class Browser:
         self.capturing = False
         self.last_capture = 0.0
         self.paused = False
+        self.stopping = False
         self.last_activity = time.monotonic()
         self.roku_ip = cfg.get("roku") or ""
         self.roku_cache = {}
@@ -338,6 +339,7 @@ class Browser:
         if not self.running:
             return
         log.info("closing browser")
+        self.stopping = True
         self._save_session()
         try:
             await self.call("Browser.close", timeout=3)
@@ -350,6 +352,7 @@ class Browser:
                 self.proc.kill()
         await self.ws.close()
         await self.cdp.close()
+        self.stopping = False
 
     async def pause(self):
         """Stop capturing while nobody is watching."""
@@ -551,8 +554,11 @@ class Browser:
         if was_active:
             if self.tabs:
                 await self._activate(self.tabs[-1])
-            elif self.running:
-                await self.call("Target.createTarget", {"url": self.home_url()})
+            elif self.running and not self.stopping:
+                try:
+                    await self.call("Target.createTarget", {"url": self.home_url()})
+                except CDPError as e:
+                    log.debug("reopening a tab: %s", e)
 
     async def refresh_info(self, tid):
         """The browser only reports a page's title when navigation starts, so ask for it."""
