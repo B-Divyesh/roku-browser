@@ -8,6 +8,7 @@ app), so they play smoothly with sound.
 """
 import asyncio
 import base64
+import contextlib
 import ctypes
 import hashlib
 import io
@@ -100,10 +101,13 @@ FOCUSED_FIELD_JS = r"""(() => {
                    (e.tagName === 'INPUT' && !nonText.includes(type));
   if (!editable || e.disabled || e.readOnly) return null;
   const label = e.getAttribute('aria-label') || e.placeholder || e.name || '';
+  // Google, Bing and Yandex search boxes are one-row textareas where Enter searches.
+  const search = e.getAttribute('role') === 'combobox' || !!e.closest('[role=search]') ||
+                 ['search', 'go', 'send'].includes(e.enterKeyHint);
   return {kind: e.isContentEditable ? 'text' : (type || 'text'),
           value: e.isContentEditable ? e.innerText : (e.value || ''),
           label: label.slice(0, 80),
-          multiline: e.tagName === 'TEXTAREA' || e.isContentEditable};
+          multiline: (e.tagName === 'TEXTAREA' || e.isContentEditable) && !search};
 })()"""
 
 # The page shown on launch and by "Start page": big targets for a remote-driven cursor.
@@ -277,6 +281,7 @@ class Browser:
         self.changed = asyncio.Condition()
         self.dirty = False
         self.capturing = False
+        self.shot_lock = asyncio.Lock()  # mouse events wait while a screenshot is taken
         self.last_capture = 0.0
         self.paused = False
         self.stopping = False
@@ -621,7 +626,9 @@ class Browser:
                 self.dirty = False
                 try:
                     links = await self.page("Runtime.evaluate", {"expression": CLICKABLE_JS, "returnByValue": True})
-                    r = await self.page("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True})
+                    async with self.shot_lock:
+                        r = await self.page("Page.captureScreenshot", {"format": "png", "optimizeForSpeed": True},
+                                            timeout=5)
                 except (CDPError, KeyError, asyncio.TimeoutError) as e:
                     log.debug("capture: %s", e)
                     break
@@ -693,6 +700,24 @@ class Browser:
 
     def css(self, q, key):
         return float(q.get(key, 0)) / self.zoom
+
+    @contextlib.asynccontextmanager
+    async def pointer(self):
+        """Mouse events go between screenshots. To take one, Chromium briefly rescales
+        the emulated view, and pointer events sent meanwhile land at 1/zoom of their
+        position. A screenshot cut short (by a navigation, say) can leave that scale
+        behind; sending the metrics again clears it, and is a no-op otherwise."""
+        try:
+            await asyncio.wait_for(self.shot_lock.acquire(), 2)
+            held = True
+        except asyncio.TimeoutError:
+            held = False
+        try:
+            await self.page("Emulation.setDeviceMetricsOverride", self.metrics())
+            yield
+        finally:
+            if held:
+                self.shot_lock.release()
 
     async def mouse(self, kind, x, y, **extra):
         await self.page("Input.dispatchMouseEvent", {"type": kind, "x": x, "y": y, **extra})
@@ -792,23 +817,27 @@ class Browser:
         if t != "move":
             self.recapture()
         if t == "move":
-            await self.mouse("mouseMoved", self.css(q, "x"), self.css(q, "y"))
+            async with self.pointer():
+                await self.mouse("mouseMoved", self.css(q, "x"), self.css(q, "y"))
         elif t == "click":
             x, y = self.css(q, "x"), self.css(q, "y")
-            await self.mouse("mouseMoved", x, y)
-            await self.mouse("mousePressed", x, y, button="left", buttons=1, clickCount=1)
-            await self.mouse("mouseReleased", x, y, button="left", buttons=0, clickCount=1)
+            async with self.pointer():
+                await self.mouse("mouseMoved", x, y)
+                await self.mouse("mousePressed", x, y, button="left", buttons=1, clickCount=1)
+                await self.mouse("mouseReleased", x, y, button="left", buttons=0, clickCount=1)
             await asyncio.sleep(0.25)
             r = await self.page("Runtime.evaluate", {"expression": FOCUSED_FIELD_JS, "returnByValue": True})
             field = r.get("result", {}).get("value")
             return {"edit": field} if field else {}
         elif t == "scroll":
-            await self.mouse("mouseWheel", self.css(q, "x"), self.css(q, "y"),
-                             deltaX=self.css(q, "dx"), deltaY=self.css(q, "dy"))
+            async with self.pointer():
+                await self.mouse("mouseWheel", self.css(q, "x"), self.css(q, "y"),
+                                 deltaX=self.css(q, "dx"), deltaY=self.css(q, "dy"))
             self.mark_dirty()
         elif t == "page":
-            await self.mouse("mouseWheel", W / self.zoom / 2, H / self.zoom / 2, deltaX=0,
-                             deltaY=int(q.get("dir", 1)) * H / self.zoom * 0.85)
+            async with self.pointer():
+                await self.mouse("mouseWheel", W / self.zoom / 2, H / self.zoom / 2, deltaX=0,
+                                 deltaY=int(q.get("dir", 1)) * H / self.zoom * 0.85)
             self.mark_dirty()
         elif t == "text":
             await self.type_text(q.get("s", ""), enter=q.get("enter") == "1", replace=q.get("replace", "1") == "1")
