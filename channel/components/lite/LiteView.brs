@@ -177,6 +177,9 @@ sub showDoc(doc as object, scroll as float, focus as integer)
     m.grid = invalid
     m.restoreScroll = scroll
     m.restoreFocus = focus
+    ' A fresh page with a header and menus first opens at its main content.
+    m.jumpTo = -1
+    if scroll = 0 and focus < 0 and doc.mainStart <> invalid and doc.mainStart > 3 then m.jumpTo = doc.mainStart
     m.scrollAnim.control = "stop"
     m.scroll = 0
     m.content.translation = [0, 0]
@@ -203,6 +206,16 @@ sub layoutSome(count as integer)
 end sub
 
 sub afterLayout()
+    if m.jumpTo >= 0 and m.pos[m.jumpTo] <> invalid
+        setScroll(m.pos[m.jumpTo].y - 70, false)
+        for i = 0 to m.focusables.Count() - 1
+            if m.focusables[i].b >= m.jumpTo
+                setFocus(i, false)
+                exit for
+            end if
+        end for
+        m.jumpTo = -1
+    end if
     if m.restoreScroll > 0 and (contentHeight() >= m.restoreScroll + m.viewH or m.next >= m.blocks.Count())
         setScroll(m.restoreScroll, false)
         m.restoreScroll = 0
@@ -210,7 +223,7 @@ sub afterLayout()
     if m.restoreFocus >= 0 and m.restoreFocus < m.focusables.Count()
         setFocus(m.restoreFocus, false)
         m.restoreFocus = -1
-    else if m.focus < 0 and m.restoreFocus < 0
+    else if m.focus < 0 and m.restoreFocus < 0 and m.jumpTo < 0
         first = firstVisibleFocusable()
         if first >= 0 then setFocus(first, false)
     end if
@@ -945,7 +958,11 @@ sub moveVertical(dir as integer)
         dy = (absY(f) - refY) * dir
         if dy > 8 and here <> "" and linkUrl(f) = here then dy = 0
         if dy > 8
-            dx = Abs(absX(f) + f.w / 2 - refX)
+            ' Sideways distance to the nearest part of it: none if it's straight below.
+            left = absX(f)
+            dx = 0
+            if refX < left then dx = left - refX
+            if refX > left + f.w then dx = refX - (left + f.w)
             score = dy + dx * 0.3
             if score < bestScore
                 bestScore = score

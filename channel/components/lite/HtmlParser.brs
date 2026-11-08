@@ -67,7 +67,7 @@ function newParserState(pageUrl as string) as object
         runs: [], plain: "", kind: "p", link: -1, bold: 0, pre: 0, quote: 0, li: 0, liFresh: false,
         chrome: 0, main: 0, space: false, skip: "", skipLen: 0, skipComment: false,
         inTitle: false, title: "", form: -1, button: invalid, select: invalid, picture: "",
-        media: false, hideTag: "", hideNest: 0, maxBlocks: 900, images: 0,
+        media: false, hideTag: "", hideNest: 0, maxBlocks: 900, images: 0, mainAt: -1, articleAt: -1,
         ws: CreateObject("roRegex", "\s+", ""),
         blockKinds: {
             p: "p", div: "p", section: "p", article: "p", main: "p", header: "p", footer: "p", nav: "p",
@@ -173,6 +173,15 @@ sub openTag(st as object, name as string, tag as string)
             st.hideNest = 0
         end if
         return
+    end if
+
+    ' Where the page's own content starts, so Lite mode can open there.
+    if st.mainAt < 0 and (name = "main" or Instr(1, lt, "role=""main""") > 0)
+        flushBlock(st)
+        st.mainAt = st.doc.blocks.Count()
+    else if st.articleAt < 0 and name = "article"
+        flushBlock(st)
+        st.articleAt = st.doc.blocks.Count()
     end if
 
     if st.skipTags.DoesExist(name)
@@ -581,6 +590,11 @@ sub finishDoc(st as object)
     if title = "" then title = doc.ogTitle
     doc.title = title
 
+    ' Flag the first block of the main content; filtering below moves indexes.
+    start = st.mainAt
+    if start < 0 then start = st.articleAt
+    if start > 3 and start < doc.blocks.Count() then doc.blocks[start].start = true
+
     ' When there's a substantial article, leave out the site's navigation and footers.
     mainChars = 0
     for each b in doc.blocks
@@ -607,6 +621,13 @@ sub finishDoc(st as object)
         blocks.Append(doc.blocks)
         doc.blocks = blocks
     end if
+    doc.mainStart = -1
+    for i = 0 to doc.blocks.Count() - 1
+        if doc.blocks[i].start = true
+            doc.mainStart = i
+            exit for
+        end if
+    end for
 end sub
 
 function decodeEntities(s as string) as string
