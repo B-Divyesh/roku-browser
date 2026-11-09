@@ -300,6 +300,10 @@ Roku's player always keeps a few seconds in hand, and needs `wf-recorder`.
 - **Dailymotion plays without sound** in Lite mode when the laptop is off: the Roku can't
   decode the audio of Dailymotion's streams by itself. With the laptop service running (and
   `ffmpeg` installed), the laptop repackages them and they play with sound.
+- **Pages look too big or too small.** ✱ → *Text size* steps through 80% to 150%; 100% is
+  the default, with pages laid out 1280 pixels wide like a laptop's. (Roku sticks draw apps
+  at 1280×720 and the TV scales that up, so 100% is also the sharpest: one page pixel per
+  pixel of the picture. Videos aren't affected; they play at the TV's full resolution.)
 - **A video in a page plays as a slideshow, without sound.** Press play on it (OK on its play
   button): it should move to the TV's own player. If it's already playing, pause it and play
   it again, or use ✱ → *Play video on TV*. Sites that protect their videos (Netflix, iPlayer,

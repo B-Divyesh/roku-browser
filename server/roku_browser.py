@@ -38,7 +38,7 @@ DEFAULTS = {
     "discovery_port": 8766,
     "home": "start",            # "start" is the built-in TV start page
     "search": "https://search.brave.com/search?q={}",
-    "zoom": 1.25,
+    "zoom": 1.0,                # 100%: pages 1280 px wide, one page pixel per pixel of the TV picture
     "idle_close_minutes": 15,
     "browser": "",              # empty: the first of BROWSERS that's installed
 }
@@ -56,7 +56,7 @@ BROWSERS = ("brave", "brave-browser", "chromium", "chromium-browser", "google-ch
 W, H = 1280, 720
 CAPTURE_INTERVAL = 0.15         # seconds between full-size captures
 JPEG_QUALITY = 88               # re-encoded with full colour detail so coloured text stays crisp
-ZOOMS = (1.0, 1.25, 1.5, 1.75)
+ZOOMS = (0.8, 0.9, 1.0, 1.1, 1.25, 1.5)
 YOUTUBE_APP = "837"
 
 log = logging.getLogger("roku-browser")
@@ -425,7 +425,10 @@ def format_for(path_or_url):
 class Browser:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.zoom = self._saved().get("zoom", cfg["zoom"])
+        saved = self._saved()
+        self.zoom = saved.get("zoom", cfg["zoom"])
+        if saved.get("v") != 2 and self.zoom == 1.25:
+            self.zoom = cfg["zoom"]     # 125% was the default before v1.3.1; it made pages look zoomed in
         self.scale = 1.0                # TV pixels per channel coordinate: 1.5 on 1080p Rokus
         self.http = None                # aiohttp session for ECP and Roku checks
         self.proc = None
@@ -580,7 +583,11 @@ class Browser:
     def _save_session(self):
         url = self.info.get(self.active, {}).get("url", "") or self._saved_url() or ""
         if url.startswith(("http://", "https://")):
-            (DATA / "session.json").write_text(json.dumps({"url": url, "zoom": self.zoom}))
+            # Private, like the browser profile: the last page visited is browsing history.
+            path = DATA / "session.json"
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                json.dump({"url": url, "zoom": self.zoom, "v": 2}, f)
+            os.chmod(path, 0o600)
 
     # ---- CDP plumbing ----------------------------------------------------
 
@@ -1162,8 +1169,11 @@ class Browser:
                 save_setting("search", self.cfg["search"])
                 self.bump()
         elif t == "zoom":
-            i = ZOOMS.index(min(ZOOMS, key=lambda z: abs(z - self.zoom)))
-            await self.set_zoom(ZOOMS[(i + 1) % len(ZOOMS)])
+            if q.get("z"):              # a size, in percent
+                await self.set_zoom(max(0.5, min(int(q["z"]) / 100, 2.0)))
+            else:                       # the next of ZOOMS
+                i = ZOOMS.index(min(ZOOMS, key=lambda z: abs(z - self.zoom)))
+                await self.set_zoom(ZOOMS[(i + 1) % len(ZOOMS)])
         elif t == "closetab":
             if len(self.tabs) > 1:
                 await self.call("Target.closeTarget", {"targetId": self.active})

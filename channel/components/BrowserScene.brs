@@ -1062,7 +1062,7 @@ sub onMenuSelect()
     end if
     if id = "zoom"
         ' Cycle in place so the size can be stepped through without reopening.
-        sizes = [100, 125, 150, 175]
+        sizes = [80, 90, 100, 110, 125, 150]
         nxt = 100
         for i = 0 to sizes.count() - 1
             if sizes[i] = m.state.zoom then nxt = sizes[(i + 1) mod sizes.count()]
