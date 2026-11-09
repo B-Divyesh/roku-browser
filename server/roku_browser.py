@@ -140,6 +140,53 @@ MEDIA_JS = r"""(() => {
   };
 })()"""
 
+# The subtitles on the video now playing: the lines of its showing (or, for players that
+# draw subtitles themselves, hidden) text track, leaving out tracks of data such as ad
+# markers. null when there are none.
+SUBTITLES_JS = r"""(() => {
+  const v = window.__rokuBrowserPlaying;
+  if (!v) return null;
+  const looksLikeText = t => {
+    const c = t.cues && t.cues[Math.floor(t.cues.length / 2)];
+    return c && typeof c.text === 'string' && !/^\s*[{[]/.test(c.text);
+  };
+  const tracks = [...v.textTracks].filter(t => t.mode !== 'disabled' && t.cues && t.cues.length >= 5 && looksLikeText(t));
+  const rank = t => (t.mode === 'showing' ? 2 : 0) + (t.kind === 'subtitles' || t.kind === 'captions' ? 1 : 0);
+  tracks.sort((a, b) => rank(b) - rank(a));
+  const t = tracks[0];
+  if (!t) return null;
+  return {label: t.label, language: t.language, cues: [...t.cues].map(c => [c.startTime, c.endTime, c.text])};
+})()"""
+
+def parse_subtitles(text):
+    """Cues from an SRT or WebVTT file, as (start, end, text) in seconds."""
+    stamp = r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})"
+    seconds = lambda h, m, s, ms: int(h or 0) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+    cues = []
+    for block in re.split(r"\n\s*\n", text.replace("\r\n", "\n").replace("\r", "\n")):
+        lines = block.strip().split("\n")
+        for i, line in enumerate(lines):
+            m = re.match(stamp + r"\s*-->\s*" + stamp, line.strip())
+            if m:
+                g = m.groups()
+                body = "\n".join(lines[i + 1:]).strip()
+                if body:
+                    cues.append((seconds(*g[:4]), seconds(*g[4:]), body))
+                break
+    return cues
+
+
+def retime(cues, offset):
+    """Cues for a copy of the video that starts `offset` seconds into it, as plain text
+    lines (markup such as <i> and {\\an8} taken out): the TV draws them itself."""
+    out = []
+    for start, end, text in cues:
+        text = re.sub(r"<[^>]*>|\{[^}]*\}", "", text).strip()
+        if end > offset and text:
+            out.append([round(max(0.0, start - offset), 2), round(end - offset, 2), text])
+    return out
+
+
 # Lite mode's pages, compiled from the rendered page by the laptop's browser.
 LITE_COMPILE_JS = (Path(__file__).parent / "lite_compile.js").read_text()
 
@@ -988,7 +1035,7 @@ class Browser:
         url = self.info.get(self.active, {}).get("url", "")
         if youtube_id(url):
             return "Open in YouTube app"
-        if self.media.get(self.active):
+        if any(m["format"] != "subtitles" for m in self.media.get(self.active, [])):
             return "Play video on TV"
         if shutil.which("yt-dlp") and url.startswith("http") and "google." not in url:
             return "Find video on this page"
@@ -1190,6 +1237,13 @@ class Browser:
                 await self.call("Target.closeTarget", {"targetId": self.active})
         elif t == "video":
             return await self.hand_off()
+        elif t == "restart":
+            result = await self.play_from(float(q.get("at") or 0))
+            if q.get("tv") and "play" in result:
+                self.action = {"id": secrets.randbelow(1 << 30), **result}   # asked from this laptop
+                self.bump()
+                return {}
+            return result
         elif t == "videoend":
             await self.video_ended(float(q.get("pos") or 0), q.get("failed") == "1")
         else:
@@ -1205,6 +1259,9 @@ class Browser:
             return
         fmt = MEDIA_MIME.get(mime)
         ext_fmt = format_for(url)
+        path = urlparse(url).path.lower()
+        if mime in ("text/vtt", "application/x-subrip") or path.endswith((".vtt", ".srt")):
+            fmt = "subtitles"
         if not fmt and ext_fmt in ("hls", "dash"):
             fmt = ext_fmt
         if not fmt and p.get("type") == "Media" and (mime.startswith("video/") or ext_fmt):
@@ -1239,24 +1296,63 @@ class Browser:
             _, session, info = self.playing
         stream = await self._page_stream(tid, session, info)
         if stream:
-            start = max(0.0, (info or {}).get("time", 0) - 1)
-            try:
-                item = await self._replay(stream, start)
-            except web.HTTPException:
-                self.no_handoff.add(stream["url"])
-                return {"notice": "The TV's player couldn't open this video"}
-            if session:
+            subtitles = await self._subtitles(tid, session)
+            result = await self._play_on_tv(stream, max(0.0, (info or {}).get("time", 0) - 1), subtitles, session)
+            if "play" in result and session:
                 try:
                     await self.call("Runtime.evaluate", {
                         "expression": "window.__rokuBrowserPlaying && window.__rokuBrowserPlaying.pause()"}, session)
                 except CDPError:
                     pass
-            self.handoff = {"url": stream["url"], "session": session, "start": start}
-            return {"play": item}
+            return result
         item = await self.ytdlp(page_url)
         if item:
             return {"play": item}
         return {"notice": "No playable video found on this page"}
+
+    async def _play_on_tv(self, stream, start, subtitles, session):
+        """The page's stream for the TV's player from `start`, with its subtitles timed to it."""
+        try:
+            item, start = await self._replay(stream, start)
+        except web.HTTPException:
+            self.no_handoff.add(stream["url"])
+            return {"notice": "The TV's player couldn't open this video"}
+        if subtitles:
+            item["cues"] = retime(subtitles[0], start)
+        log.info("the TV plays it from %.0f s, with %d subtitle lines", start, len(item.get("cues", [])))
+        self.handoff = {"url": stream["url"], "session": session, "start": start,
+                        "stream": stream, "subtitles": subtitles, "at": time.monotonic()}
+        if session:
+            asyncio.create_task(self._settle_subtitles(self.handoff))
+        return {"play": item}
+
+    async def _settle_subtitles(self, h):
+        """Players often load subtitles just after the video starts, which is when it goes
+        to the TV, and some briefly hold several languages while choosing one. For a
+        while, look again, and send the TV whatever they settle on."""
+        tid = self.active
+        sent = len(h["subtitles"][0]) if h["subtitles"] else 0
+        for _ in range(20):
+            await asyncio.sleep(1)
+            if self.handoff is not h:
+                return              # stopped, or replaced by another copy
+            subtitles = await self._subtitles(tid, h["session"])
+            if subtitles and len(subtitles[0]) != sent:
+                sent = len(subtitles[0])
+                h["subtitles"] = subtitles
+                cues = retime(subtitles[0], h["start"])
+                log.info("the page's subtitles changed: sending %d lines to the TV", len(cues))
+                self.action = {"id": secrets.randbelow(1 << 30), "cues": cues}
+                self.bump()
+
+    async def play_from(self, at):
+        """The page video on the TV again from `at` seconds: the copy began where the page
+        was, so its earlier part isn't there to rewind into."""
+        h = self.handoff
+        if not h:
+            return {}
+        subtitles = await self._subtitles(self.active, h["session"]) or h["subtitles"]
+        return await self._play_on_tv(h["stream"], max(0.0, at), subtitles, h["session"])
 
     async def _media_playing(self, tid, session, info):
         """A video (or audio) started in the page. If it's a film, or the viewer started
@@ -1269,7 +1365,7 @@ class Browser:
         log.info("page media playing: %s (muted=%s, %.0f%% of its frame, %.0f s long, last click %.0f s ago)",
                  (info.get("src") or "?")[:90], info.get("muted"), 100 * info.get("area", 0),
                  info.get("duration", -1), time.monotonic() - self.last_click)
-        if self.handoff and not await self._tv_playing():
+        if self.handoff and time.monotonic() - self.handoff["at"] > 20 and not await self._tv_playing():
             self.handoff = None         # the TV's player was left some other way (Home, say)
         duration, area, src = info.get("duration", -1), info.get("area", 0), info.get("src")
         since_click = time.monotonic() - self.last_click
@@ -1321,7 +1417,7 @@ class Browser:
         it in pieces (a blob: address), the playlist its frame loaded. Players load their
         master playlist and then its variants; adverts come from frames of their own."""
         src = (info or {}).get("src", "")
-        found = self.media.get(tid, [])
+        found = [m for m in self.media.get(tid, []) if m["format"] != "subtitles"]
         if src.startswith("http"):
             known = next((m for m in found if m["url"] == src), None)
             return known or {"url": src, "format": format_for(src) or "mp4", "session": session, "headers": {}}
@@ -1370,10 +1466,36 @@ class Browser:
             text = await self._body(m)
             if text:
                 url, audio = hls_choice(text, m["url"])
-        key = await self.remuxer.start(url, headers=headers, start=start,
-                                       user_agent=h.get("user-agent") or self.ua, audio=audio)
+        ua = h.get("user-agent") or self.ua
+        # The copy starts at the keyframe at or before `start`; that's where the TV's
+        # timeline begins, for subtitles and for picking up again in the page.
+        key, start = await asyncio.gather(
+            self.remuxer.start(url, headers=headers, start=start, user_agent=ua, audio=audio),
+            Remuxer.keyframe(url, headers, start, ua))
         return {"url": f"{self.base_url()}/remux/{key}/index.m3u8", "format": "hls", "headers": [],
-                "title": info.get("title", ""), "page": True}
+                "title": info.get("title", ""), "page": True}, start
+
+    async def _subtitles(self, tid, session):
+        """The subtitles of the video now playing, as (cues, label, language): the lines of
+        its text track or, for players without one, the subtitle file they fetched."""
+        if session:
+            try:
+                r = await self.call("Runtime.evaluate", {"expression": SUBTITLES_JS, "returnByValue": True},
+                                    session, timeout=5)
+                got = r.get("result", {}).get("value")
+            except (CDPError, asyncio.TimeoutError):
+                got = None
+            if got and got.get("cues"):
+                return [tuple(c) for c in got["cues"]], got.get("label") or "", got.get("language") or ""
+        # A player with no text track: the subtitle file it fetched, but only if there's one.
+        # Players that fetch every language at once keep the chosen one in their track.
+        files = [m for m in self.media.get(tid, []) if m["format"] == "subtitles"]
+        files = [m for m in files if m["session"] == session] or files
+        if len(files) == 1:
+            cues = parse_subtitles(await self._body(files[0]))
+            if cues:
+                return cues, "", ""
+        return None
 
     async def dailymotion_item(self, video_id):
         """A Dailymotion video as a stream the Roku plays with sound (remuxed here)."""
@@ -1572,7 +1694,12 @@ class Remuxer:
         if key != self.key or not (alive or (out / "index.m3u8").exists()):
             if alive:
                 self.proc.kill()
-            shutil.rmtree(self.dir, ignore_errors=True)
+            # Keep the copy the TV is playing now, which goes on until the new one
+            # replaces it on screen; anything older goes.
+            for old in (self.dir.iterdir() if self.dir.is_dir() else ()):
+                if old.name not in (self.key, key):
+                    shutil.rmtree(old, ignore_errors=True)
+            shutil.rmtree(out, ignore_errors=True)
             out.mkdir(parents=True)
             self.key = key
             source = ["-user_agent", user_agent]
@@ -1603,6 +1730,24 @@ class Remuxer:
                 raise web.HTTPBadGateway(text="couldn't read that stream")
             await asyncio.sleep(0.2)
         raise web.HTTPGatewayTimeout(text="the stream took too long to start")
+
+    @staticmethod
+    async def keyframe(url, headers=(), start=0.0, user_agent=ROKU_UA):
+        """Where a copy asked to start at `start` really starts: the keyframe at or
+        before it, which is what ffmpeg's seek lands on (ffprobe seeks the same way).
+        Subtitles are timed against it."""
+        if not start:
+            return 0.0
+        args = ["ffprobe", "-v", "error", "-user_agent", user_agent]
+        if headers:
+            args += ["-headers", "".join(h + "\r\n" for h in headers)]
+        args += ["-read_intervals", f"{start:.2f}%+#1", "-select_streams", "v:0", "-skip_frame", "nokey",
+                 "-show_entries", "frame=pts_time", "-of", "csv=p=0", url]
+        out = await command_output(*args, timeout=15)
+        try:
+            return float(out.split()[0])
+        except (IndexError, ValueError):
+            return start
 
     def stop(self, clean=False):
         if self.proc is not None and self.proc.returncode is None:

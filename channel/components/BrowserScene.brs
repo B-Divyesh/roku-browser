@@ -27,6 +27,13 @@ sub init()
     m.scrollId = 0
     m.pendingScrolls = []       ' scrolls sent that the picture on screen doesn't include yet
     m.slideClock = CreateObject("roTimespan")
+    m.subs = m.top.findNode("subs")
+    m.subLabels = buildSubtitles()
+    m.cues = invalid
+    m.cueAt = 0
+    m.subText = ""
+    m.subsOn = true
+    m.top.findNode("video").observeField("position", "onVideoPosition")
     m.bar = m.top.findNode("topbar")
     m.barIn = m.top.findNode("barIn")
     m.barOut = m.top.findNode("barOut")
@@ -214,7 +221,9 @@ end sub
 
 ' Back on the scene, menu or keyboard: focus goes to whichever mode is showing.
 sub restoreFocus()
-    if m.mode = "lite"
+    if m.video.visible
+        m.video.setFocus(true)
+    else if m.mode = "lite"
         m.lite.setFocus(true)
     else
         m.top.setFocus(true)
@@ -631,9 +640,18 @@ end sub
 ' ---- remote -------------------------------------------------------------
 
 function onKeyEvent(key as string, press as boolean) as boolean
+    if m.menu.visible
+        if press and (key = "back" or key = "options") then closeMenu()
+        return true
+    end if
     if m.video.visible
         if press and key = "back"
             stopVideo()
+            return true
+        end if
+        ' The player keeps ↺ and the arrows for itself; ✱ comes here.
+        if press and key = "options" and (m.pageVideo = true or m.cues <> invalid)
+            openVideoMenu("")
             return true
         end if
         return false
@@ -885,6 +903,13 @@ sub runAction(a as object)
     m.lastAction = a.id
     if a.notice <> invalid then showNotice(a.notice)
     if a.play <> invalid then playVideo(a.play)
+    ' Subtitles that loaded after the video went to the TV.
+    if a.cues <> invalid and m.video.visible and m.pageVideo = true
+        m.cues = a.cues
+        m.cueAt = 0
+        m.video.notificationInterval = 0.2
+        m.subs.visible = m.subsOn
+    end if
 end sub
 
 ' ---- typing -------------------------------------------------------------
@@ -939,6 +964,8 @@ sub onKeyboardButton()
                 send("nav", {q: text})
             end if
         end if
+    else if m.kbMode = "time"
+        if choice = "Go" and text.Trim() <> "" then playFrom(parseTime(text))
     else if m.kbMode = "lite"
         if choice <> "Cancel" then m.lite.input = {field: m.kbField, text: text, submit: choice = "Go"}
     else if choice = "Enter"
@@ -1041,8 +1068,123 @@ sub closeMenu()
     end if
 end sub
 
+' ✱ while a page's video plays in the TV's player.
+sub openVideoMenu(focusId as string)
+    items = []
+    if m.cues <> invalid
+        state = "Off"
+        if m.subsOn then state = "On"
+        items.Push({id: "vsubs", title: "Subtitles", value: state})
+    end if
+    if m.pageVideo = true
+        items.Push({id: "vstart", title: "Watch from the beginning", value: ""})
+        items.Push({id: "vtime", title: "Start at a time" + Chr(8230), value: ""})
+        items.Push({id: "vstop", title: "Back to the page", value: ""})
+    else
+        items.Push({id: "vstop", title: "Stop", value: ""})
+    end if
+    title = "Video"
+    if m.video.content <> invalid and m.video.content.title <> "" then title = m.video.content.title
+    showMenu(items, focusId, title, "")
+end sub
+
+sub onVideoMenu(id as string)
+    if id = "vsubs"
+        ' Stepped in place, like text size.
+        m.subsOn = not m.subsOn
+        m.subs.visible = m.subsOn and m.cues <> invalid
+        openVideoMenu("vsubs")
+        return
+    end if
+    closeMenu()
+    if id = "vstart"
+        playFrom(0)
+    else if id = "vtime"
+        showKeyboard("time", "Start at: minutes, or minutes:seconds", "", "text", ["Go", "Cancel"])
+    else if id = "vstop"
+        stopVideo()
+    end if
+end sub
+
+' The copy on the TV began where the page was; this makes a new one from `seconds`. The
+' player stops first, quietly, and the new copy replaces it.
+sub playFrom(seconds as integer)
+    m.restarting = true
+    m.video.control = "stop"
+    showNotice("Starting at " + clock(seconds) + Chr(8230))
+    send("restart", {at: seconds}, 30000)
+end sub
+
+function clock(seconds as integer) as string
+    s = (seconds mod 60).toStr()
+    if Len(s) < 2 then s = "0" + s
+    return Int(seconds / 60).toStr() + ":" + s
+end function
+
+' "1", "1:30", "90:00": minutes, or minutes and seconds.
+function parseTime(text as string) as integer
+    parts = text.Trim().Split(":")
+    if parts.Count() = 1 then return Int(Val(parts[0]) * 60)
+    return Int(Val(parts[0])) * 60 + Int(Val(parts[1]))
+end function
+
+' ---- subtitles ----------------------------------------------------------
+
+' Eight dark copies a little off in each direction, then the white text: an outline
+' all round, with nothing behind it.
+function buildSubtitles() as object
+    labels = []
+    for each o in [[-2, -2], [0, -2], [2, -2], [-2, 0], [2, 0], [-2, 2], [0, 2], [2, 2], [0, 0]]
+        label = m.subs.createChild("Label")
+        label.translation = [80 + o[0], 470 + o[1]]
+        label.width = 1120
+        label.height = 190
+        label.horizAlign = "center"
+        label.vertAlign = "bottom"
+        label.wrap = true
+        label.maxLines = 3
+        font = CreateObject("roSGNode", "Font")
+        font.uri = "pkg:/fonts/Inter-SemiBold.ttf"
+        font.size = 31
+        label.font = font
+        if o[0] = 0 and o[1] = 0 then label.color = "0xFFFFFFFF" else label.color = "0x000000E6"
+        labels.Push(label)
+    end for
+    return labels
+end function
+
+sub setSubtitle(text as string)
+    if text = m.subText then return
+    m.subText = text
+    for each label in m.subLabels
+        label.text = text
+    end for
+end sub
+
+' The line for where the player is. Cues are in time order; the search carries on from the
+' last one, and starts over after a jump back.
+sub onVideoPosition()
+    if m.cues = invalid or not m.subs.visible then return
+    played = m.video.position
+    n = m.cues.Count()
+    i = m.cueAt
+    if i > n then i = n
+    if i > 0 and m.cues[i - 1][1] > played then i = 0
+    while i < n and m.cues[i][1] <= played
+        i = i + 1
+    end while
+    m.cueAt = i
+    text = ""
+    if i < n and m.cues[i][0] <= played then text = m.cues[i][2]
+    setSubtitle(text)
+end sub
+
 sub onMenuSelect()
     id = m.menuItems[m.menuList.itemSelected].id
+    if id = "vsubs" or id = "vstart" or id = "vtime" or id = "vstop"
+        onVideoMenu(id)
+        return
+    end if
     if Left(id, 7) = "engine:"
         closeMenu()
         name = Mid(id, 8)
@@ -1126,6 +1268,7 @@ sub startMirror()
 end sub
 
 sub playVideo(p as object)
+    m.restarting = false
     content = CreateObject("roSGNode", "ContentNode")
     content.url = p.url
     content.streamFormat = p.format
@@ -1140,12 +1283,23 @@ sub playVideo(p as object)
     m.pageVideo = (p.page = true)
     hideNotice()
     m.video.content = content
+    ' The page's subtitles, brought along and already timed to this copy by the laptop.
+    m.cues = invalid
+    setSubtitle("")
+    if p.cues <> invalid and p.cues.Count() > 0
+        m.cues = p.cues
+        m.cueAt = 0
+        m.video.notificationInterval = 0.2
+    end if
+    m.subs.visible = m.cues <> invalid and m.subsOn
     m.video.visible = true
     m.cursor.visible = false
     m.highlight.visible = false
     m.video.setFocus(true)
     m.video.control = "play"
-    if m.pageVideo then showNotice("Back returns to the page")
+    if m.pageVideo = true
+        showNotice("Back: the page  ·  " + Chr(10033) + " subtitles, start over")
+    end if
 end sub
 
 sub stopVideo(failed = false as boolean)
@@ -1161,6 +1315,9 @@ sub stopVideo(failed = false as boolean)
         send("mirror", {on: 0})
     end if
     m.video.control = "stop"
+    m.cues = invalid
+    m.subs.visible = false
+    setSubtitle("")
     m.video.visible = false
     if m.mode <> "lite"
         m.cursor.visible = true
@@ -1172,6 +1329,7 @@ end sub
 
 sub onVideoState()
     st = m.video.state
+    if m.restarting = true and (st = "stopped" or st = "error" or st = "finished") then return
     if st = "error"
         print "video error: "; m.video.errorCode; " "; m.video.errorMsg
         mirroring = m.mirroring
