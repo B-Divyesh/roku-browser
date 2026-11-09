@@ -120,13 +120,21 @@ MEDIA_JS = r"""(() => {
   document.addEventListener('playing', e => {
     if (e.target instanceof HTMLMediaElement) report(e.target);
   }, true);
+  // Players that start muted (as autoplay must) and are unmuted by the viewer.
+  document.addEventListener('volumechange', e => {
+    const v = e.target;
+    if (v instanceof HTMLMediaElement && !v.paused && !v.muted && v.volume > 0) report(v);
+  }, true);
   // Players built as web components keep their <video> in a shadow root, whose media
   // events never reach the document; they all start it with play(), though.
   const play = HTMLMediaElement.prototype.play;
   HTMLMediaElement.prototype.play = function () {
     if (!this.__rokuBrowserHooked) {
       this.__rokuBrowserHooked = true;
-      if (this.getRootNode() !== document) this.addEventListener('playing', () => report(this));
+      if (this.getRootNode() !== document) {
+        this.addEventListener('playing', () => report(this));
+        this.addEventListener('volumechange', () => { if (!this.paused && !this.muted) report(this); });
+      }
     }
     return play.apply(this, arguments);
   };
@@ -449,6 +457,8 @@ class Browser:
         self.request_headers = {}       # (session, request id) -> headers that matter for replaying it
         self.last_click = 0.0           # videos only go to the TV's player when the user started them
         self.handoff = None             # the page video now playing in the TV's player
+        self.declined = set()           # page videos the viewer came back from (Back)
+        self.handing = asyncio.Lock()   # pages often announce "playing" twice at once
         self.playing = None             # (target, session, details) of the media last started
         self.no_handoff = set()         # streams the TV's player couldn't play
         self.loading = set()
@@ -1249,19 +1259,28 @@ class Browser:
         return {"notice": "No playable video found on this page"}
 
     async def _media_playing(self, tid, session, info):
-        """A video (or audio) started in the page. If the user started it and it isn't an
-        advert, it goes to the TV's player."""
+        """A video (or audio) started in the page. If it's a film, or the viewer started
+        it and it isn't an advert, it goes to the TV's player."""
+        async with self.handing:
+            await self._consider(tid, session, info)
+
+    async def _consider(self, tid, session, info):
         self.playing = (tid, session, info)
         log.info("page media playing: %s (muted=%s, %.0f%% of its frame, %.0f s long, last click %.0f s ago)",
                  (info.get("src") or "?")[:90], info.get("muted"), 100 * info.get("area", 0),
                  info.get("duration", -1), time.monotonic() - self.last_click)
         if self.handoff and not await self._tv_playing():
             self.handoff = None         # the TV's player was left some other way (Home, say)
-        if (self.handoff or self.paused or info.get("muted")
-                or time.monotonic() - self.last_click > 120     # not something the user started
-                or (info.get("video") and info.get("area", 0) < 0.08)    # a tiny or hidden player
-                or 0 < info.get("duration", -1) < 45            # an advert or a preview
-                or info.get("src") in self.no_handoff):
+        duration, area, src = info.get("duration", -1), info.get("area", 0), info.get("src")
+        since_click = time.monotonic() - self.last_click
+        # A film or an episode: on a TV it's only worth watching in the TV's player, even if
+        # the page started it by itself, muted, as autoplay has to be.
+        feature = duration >= 480 and area >= 0.45 and src not in self.declined
+        # Anything else once the viewer starts it (a click, or turning the sound on), unless
+        # it's a tiny player or a clip short enough to be an advert or a preview.
+        chosen = ((since_click <= 15 or (since_click <= 120 and not info.get("muted")))
+                  and not (info.get("video") and area < 0.08) and not 0 < duration < 45)
+        if self.handoff or self.paused or src in self.no_handoff or not (feature or chosen):
             return
         result = await self.hand_off(session, info)
         log.info("handing the page's video to the TV: %s", result.get("play", {}).get("url") or result.get("notice"))
@@ -1278,6 +1297,9 @@ class Browser:
             return
         if failed:
             self.no_handoff.add(h["url"])
+        # Back to the page by choice: it stays there unless the viewer plays it again.
+        if self.playing and self.playing[2].get("src"):
+            self.declined.add(self.playing[2]["src"])
         if h["session"]:
             js = (f"(v => {{ if (v) {{ v.currentTime = {h['start'] + pos:.2f}; v.pause(); }} }})"
                   "(window.__rokuBrowserPlaying)")
