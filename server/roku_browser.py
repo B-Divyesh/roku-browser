@@ -756,12 +756,13 @@ class Browser:
         """For a page and every frame embedded in it: our user agent, network events (to
         find video streams) and the play reporter. Frames from other sites are separate
         targets, and video players very often are one."""
-        # A frame is caught before its document exists; Chrome applies scripts and
-        # bindings to documents still to come only with these domains switched on.
-        early = (("Page.enable", {}), ("Runtime.enable", {})) if sid in self.frames else ()
+        # Chrome adds the binding to documents still to come (the page after every
+        # navigation) only with Runtime switched on; without it, the binding stayed on
+        # the blank page a tab starts as, and players in the page itself never reported.
         try:
             for method, params in (
-                *early,
+                ("Page.enable", {}),
+                ("Runtime.enable", {}),
                 ("Network.enable", {}),
                 ("Emulation.setUserAgentOverride", {
                     "userAgent": self.ua, "acceptLanguage": "en-GB,en", "platform": "Linux",
