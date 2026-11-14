@@ -176,6 +176,12 @@ def parse_subtitles(text):
     return cues
 
 
+def pictures(cues):
+    """A .vtt of preview pictures for a seek bar ("thumbs.jpg#xywh=0,0,160,90"), not words."""
+    images = sum(1 for _, _, text in cues if re.search(r"#xywh=|\.(jpe?g|png|webp|gif)(\?|#|$)", text.strip(), re.I))
+    return images > len(cues) / 2
+
+
 def retime(cues, offset):
     """Cues for a copy of the video that starts `offset` seconds into it, as plain text
     lines (markup such as <i> and {\\an8} taken out): the TV draws them itself."""
@@ -1487,14 +1493,18 @@ class Browser:
                 got = None
             if got and got.get("cues"):
                 return [tuple(c) for c in got["cues"]], got.get("label") or "", got.get("language") or ""
-        # A player with no text track: the subtitle file it fetched, but only if there's one.
-        # Players that fetch every language at once keep the chosen one in their track.
+        # A player with no text track (JW Player draws its own): a subtitle file it fetched.
+        # Not the seek bar's preview pictures, which come as a .vtt too; given a choice,
+        # English if it's marked, else the one fetched last, which is the language picked.
         files = [m for m in self.media.get(tid, []) if m["format"] == "subtitles"]
-        files = [m for m in files if m["session"] == session] or files
-        if len(files) == 1:
-            cues = parse_subtitles(await self._body(files[0]))
-            if cues:
-                return cues, "", ""
+        usable = []
+        for m in [m for m in files if m["session"] == session] or files:
+            cues = parse_subtitles(await self._body(m))
+            if cues and not pictures(cues):
+                usable.append((m["url"], cues))
+        if usable:
+            english = [u for u in usable if re.search(r"(^|[^a-z])(en|eng|english)([^a-z]|$)", u[0].lower())]
+            return (english or usable)[-1][1], "", ""
         return None
 
     async def dailymotion_item(self, video_id):
@@ -1702,7 +1712,7 @@ class Remuxer:
             shutil.rmtree(out, ignore_errors=True)
             out.mkdir(parents=True)
             self.key = key
-            source = ["-user_agent", user_agent]
+            source = ["-user_agent", user_agent, "-rw_timeout", "15000000"]
             if headers:
                 source += ["-headers", "".join(h + "\r\n" for h in headers)]
             if start:
@@ -2174,6 +2184,11 @@ def make_app(b):
         since, sv = int(req.query.get("since", -1)), int(req.query.get("sv", -1))
         if req.remote not in ("127.0.0.1", "::1"):
             b.roku_ip = req.remote
+            if b.cfg.get("roku") != req.remote:
+                # The network gave the Roku a new address: remember it for the roku command too.
+                b.cfg["roku"] = req.remote
+                save_setting("roku", req.remote)
+                log.info("the Roku is now at %s", req.remote)
         await b.set_scale(int(req.query.get("w", W)))
         await b.ensure()
 

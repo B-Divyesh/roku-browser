@@ -81,7 +81,7 @@ def roku_ip():
     return found[0]
 
 
-def ecp(path, method="POST", timeout=5):
+def ecp(path, method="POST", timeout=5, search=True):
     req = urllib.request.Request(f"http://{roku_ip()}:8060/{path}", method=method,
                                  data=b"" if method == "POST" else None)
     try:
@@ -92,6 +92,15 @@ def ecp(path, method="POST", timeout=5):
             sys.exit("The Roku refused that. Set Settings > System > Advanced system settings > "
                      "Control by mobile apps > Network access to Enabled or Permissive.")
         raise
+    except (urllib.error.URLError, OSError):
+        # The network may have given the Roku a new address: look for it once.
+        found = discover() if search else []
+        cfg = config()
+        if not found or found[0] == cfg.get("roku"):
+            raise
+        cfg["roku"] = found[0]
+        save_config(cfg)
+        return ecp(path, method, timeout, search=False)
 
 
 def tag(xml, name):
