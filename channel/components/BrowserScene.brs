@@ -510,7 +510,8 @@ function buildBar() as object
         {id: "back", x: 16, w: 56, text: "←"},
         {id: "forward", x: 80, w: 56, text: "→"},
         {id: "reload", x: 144, w: 56, text: "↻"},
-        {id: "address", x: 216, w: 812, text: ""},
+        {id: "address", x: 216, w: 688, text: ""},
+        {id: "history", x: 916, w: 112, text: "History"},
         {id: "engine", x: 1040, w: 224, text: ""}
     ]
     items = []
@@ -530,6 +531,10 @@ function buildBar() as object
         font.uri = "pkg:/fonts/Inter-Medium.ttf"
         if spec.w < 60
             font.size = 26
+            label.width = spec.w
+            label.horizAlign = "center"
+        else if spec.text <> ""
+            font.size = 20
             label.width = spec.w
             label.horizAlign = "center"
         else
@@ -619,6 +624,9 @@ sub barAction(id as string)
     else if id = "address"
         hideBar()
         openAddress()
+    else if id = "history"
+        hideBar()
+        send("history")
     else if id = "engine"
         hideBar()
         openEngineMenu()
@@ -989,6 +997,7 @@ sub openMenu(focusId = "" as string)
     s = m.state
     items = [{id: "address", title: "Search or enter address", value: ""}]
     if s.video <> invalid and s.video <> "" then items.push({id: "video", title: s.video, value: ""})
+    items.push({id: "history", title: "History", value: ""})
     items.push({id: "mirror", title: "Show laptop screen", value: ""})
     if s.fwd = true then items.push({id: "forward", title: "Forward", value: ""})
     items.push({id: "reload", title: "Reload", value: ""})
@@ -1007,6 +1016,7 @@ sub openLiteMenu(focusId as string)
     s = m.lite.status
     items = [{id: "address", title: "Search or enter address", value: ""}]
     items.push({id: "reload", title: "Reload", value: ""})
+    items.push({id: "history", title: "History", value: ""})
     items.push({id: "zoom", title: "Text size", value: Int(m.liteScale * 100 + 0.5).toStr() + "%"})
     items.push({id: "home", title: "Start page", value: ""})
     if m.laptopAvailable
@@ -1034,13 +1044,16 @@ sub showMenu(items as object, focusId as string, title as string, subtitle as st
         if items[i].id = focusId then focus = i
     end for
     m.menuItems = items
-    m.menuList.numRows = items.count()
+    ' Ten rows fit on the screen; longer menus scroll.
+    rows = items.count()
+    if rows > 10 then rows = 10
+    m.menuList.numRows = rows
     m.menuList.content = content
     m.menuList.jumpToItem = focus
     m.menuTitle.text = title
     m.menuSub.text = subtitle
 
-    listH = items.count() * 56 - 4
+    listH = rows * 56 - 4
     cardH = 112 + listH + 24
     top = Int((720 - cardH) / 2)
     m.menuCard.height = cardH
@@ -1220,7 +1233,7 @@ sub onMenuSelect()
     else if id = "video"
         showNotice("Finding the video…")
         send("video", invalid, 50000)
-    else if id = "forward" or id = "reload" or id = "home" or id = "closetab"
+    else if id = "forward" or id = "reload" or id = "home" or id = "closetab" or id = "history"
         send(id)
     else if id = "help"
         showHints()
@@ -1246,7 +1259,7 @@ sub onLiteMenuSelect(id as string)
     closeMenu()
     if id = "address"
         openAddress()
-    else if id = "reload" or id = "home"
+    else if id = "reload" or id = "home" or id = "history"
         m.lite.command = id
     else if id = "full"
         enterFull()

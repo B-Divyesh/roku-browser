@@ -43,6 +43,9 @@ sub init()
     m.repeatKey = ""
     m.clock = CreateObject("roTimespan")
     m.okHeldUntil = 0
+    m.visitsReg = CreateObject("roRegistrySection", "history")
+    m.visits = invalid
+    m.clearArmed = -10000
 end sub
 
 ' The scene closed its menu: the OK that chose the item may arrive here too.
@@ -55,28 +58,56 @@ end sub
 sub onNavigate()
     n = m.top.navigate
     if n = invalid or n.url = invalid then return
-    if n.url = "lite:start"
-        if m.doc <> invalid then pushHistory()
-        m.url = "lite:start"
-        showDoc(startDoc(), 0, -1)
-        setStatus(false)
+    if Left(n.url, 5) = "lite:"
+        openOwnPage(n.url)
         return
     end if
     load(n.url, n.post, true, invalid)
 end sub
+
+' This app's own pages: the start page and the history.
+sub openOwnPage(url as string)
+    if url = "lite:clearhistory"
+        ' Two presses, so one slip of OK doesn't lose it.
+        now = m.clock.TotalMilliseconds()
+        if now - m.clearArmed > 4000
+            m.clearArmed = now
+            m.top.request = {notice: "Press OK again to clear the history"}
+            return
+        end if
+        m.clearArmed = -10000
+        m.visits = []
+        m.visitsReg.Delete("pages")
+        m.visitsReg.Flush()
+        showDoc(historyDoc(), 0, -1)
+        m.top.request = {notice: "History cleared"}
+        return
+    end if
+    if url <> m.url and m.doc <> invalid then pushHistory()
+    m.url = url
+    showDoc(ownDoc(url), 0, -1)
+    setStatus(false)
+end sub
+
+function ownDoc(url as string) as object
+    if url = "lite:history" then return historyDoc()
+    return startDoc()
+end function
 
 sub onCommand()
     c = m.top.command
     if c = "back"
         if not goBack() then m.top.request = {exitAsk: true}
     else if c = "reload"
-        if m.url = "lite:start" or m.url = ""
-            showDoc(startDoc(), 0, -1)
+        if Left(m.url, 5) = "lite:" or m.url = ""
+            showDoc(ownDoc(m.url), 0, -1)
         else
             load(m.url, invalid, false, invalid)
         end if
     else if c = "home"
         m.top.navigate = {url: "lite:start"}
+    else if c = "history"
+        m.top.navigate = {url: "lite:history"}
     end if
 end sub
 
@@ -105,6 +136,9 @@ sub onResult()
         if p.push and m.doc <> invalid then pushHistory()
         m.url = r.url
         showDoc(r.doc, 0, -1)
+        title = ""
+        if r.doc.title <> invalid then title = r.doc.title
+        noteVisit(r.url, title)
     else if r.play <> invalid
         m.top.request = {play: r.play, notice: r.notice}
     else if r.launch <> invalid
@@ -129,6 +163,9 @@ function goBack() as boolean
     if e.doc <> invalid
         showDoc(e.doc, e.scroll, e.focus)
         setStatus(false)
+    else if Left(e.url, 5) = "lite:"
+        showDoc(ownDoc(e.url), 0, -1)
+        setStatus(false)
     else
         load(e.url, invalid, false, invalid)
     end if
@@ -145,6 +182,10 @@ end sub
 
 sub follow(url as string)
     if url = "" then return
+    if Left(url, 5) = "lite:"
+        openOwnPage(url)
+        return
+    end if
     load(url, invalid, true, invalid)
 end sub
 
@@ -1181,4 +1222,92 @@ function startDoc() as object
     note = "Lite mode runs on the Roku itself, without JavaScript: news, reference and search sites work, and videos play in the Roku's player or the YouTube app. For every site exactly as on a computer, run roku-browser on your laptop."
     doc.blocks.Push({k: "caption", r: [{s: note, a: -1, b: false, o: 0}], t: note})
     return doc
+end function
+
+' ---- history ------------------------------------------------------------------
+
+' Pages opened in Lite mode, newest first, kept on this Roku. (The full browser keeps
+' its own, on the laptop.) A Roku app has 16 KB of storage, so this stays small.
+function visits() as object
+    if m.visits = invalid
+        m.visits = []
+        saved = ParseJson(m.visitsReg.Read("pages"))
+        if type(saved) = "roArray" then m.visits = saved
+    end if
+    return m.visits
+end function
+
+sub noteVisit(url as string, title as string)
+    if Left(url, 4) <> "http" or Len(url) > 500 then return
+    if Len(title) > 90 then title = Left(title, 89) + Chr(8230)
+    now = CreateObject("roDateTime").AsSeconds()
+    kept = [{u: url, t: title, s: now}]
+    for each v in visits()
+        if v.u <> url and kept.Count() < 60 then kept.Push(v)
+    end for
+    saved = FormatJson(kept)
+    while Len(saved) > 7000 and kept.Count() > 1
+        kept.Pop()
+        saved = FormatJson(kept)
+    end while
+    m.visits = kept
+    m.visitsReg.Write("pages", saved)
+    m.visitsReg.Flush()
+end sub
+
+function historyDoc() as object
+    doc = {title: "History", url: "lite:history", base: "", links: [], videos: [], forms: [], blocks: []}
+    doc.blocks.Push(textRun("h1", "History", -1))
+    pages = visits()
+    if pages.Count() = 0
+        doc.blocks.Push(textRun("caption", "Pages you open in Lite mode will be listed here. The full browser keeps its own history: press " + Chr(10033) + " there and choose History.", -1))
+        return doc
+    end if
+    now = CreateObject("roDateTime")
+    now.ToLocalTime()
+    yesterday = CreateObject("roDateTime")
+    yesterday.FromSeconds(CreateObject("roDateTime").AsSeconds() - 86400)
+    yesterday.ToLocalTime()
+    heading = ""
+    for each v in pages
+        d = CreateObject("roDateTime")
+        d.FromSeconds(v.s)
+        d.ToLocalTime()
+        label = dayName(d, now, yesterday)
+        if label <> heading
+            doc.blocks.Push(textRun("h3", label, -1))
+            heading = label
+        end if
+        title = v.t
+        if title = "" then title = urlHost(v.u)
+        doc.links.Push({u: v.u})
+        detail = "   " + urlHost(v.u) + "  " + Chr(183) + "  " + twoDigits(d.GetHours()) + ":" + twoDigits(d.GetMinutes())
+        doc.blocks.Push({k: "p", r: [{s: title, a: doc.links.Count() - 1, b: false, o: 0}, {s: detail, a: -1, b: false, o: Len(title)}], t: title + detail})
+    end for
+    doc.blocks.Push({k: "hr"})
+    doc.links.Push({u: "lite:clearhistory"})
+    doc.blocks.Push(textRun("p", "Clear history", doc.links.Count() - 1))
+    note = "Pages opened in Lite mode, kept on this Roku. The full browser keeps its own history on your laptop."
+    doc.blocks.Push(textRun("caption", note, -1))
+    return doc
+end function
+
+function textRun(kind as string, text as string, link as integer) as object
+    return {k: kind, r: [{s: text, a: link, b: false, o: 0}], t: text}
+end function
+
+function dayName(d as object, now as object, yesterday as object) as string
+    if sameDay(d, now) then return "Today"
+    if sameDay(d, yesterday) then return "Yesterday"
+    months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    return d.GetWeekday() + " " + d.GetDayOfMonth().ToStr() + " " + months[d.GetMonth() - 1]
+end function
+
+function sameDay(a as object, b as object) as boolean
+    return a.GetYear() = b.GetYear() and a.GetMonth() = b.GetMonth() and a.GetDayOfMonth() = b.GetDayOfMonth()
+end function
+
+function twoDigits(n as integer) as string
+    if n < 10 then return "0" + n.ToStr()
+    return n.ToStr()
 end function
