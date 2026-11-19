@@ -11,6 +11,7 @@ import base64
 import contextlib
 import ctypes
 import hashlib
+import html
 import io
 import json
 import logging
@@ -21,6 +22,7 @@ import secrets
 import shutil
 import signal
 import socket
+import sqlite3
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urljoin, urlparse
@@ -74,6 +76,8 @@ KEYS = {
     "a": dict(key="a", code="KeyA", windowsVirtualKeyCode=65),
 }
 
+# What players' hidden playlists come as; the text itself shows whether one is.
+VAGUE_MIME = ("text/plain", "application/octet-stream", "binary/octet-stream", "", "application/x-unknown")
 MEDIA_MIME = {
     "application/vnd.apple.mpegurl": "hls", "application/x-mpegurl": "hls",
     "audio/mpegurl": "hls", "audio/x-mpegurl": "hls", "application/dash+xml": "dash",
@@ -221,7 +225,7 @@ FOCUSED_FIELD_JS = r"""(() => {
 
 # The page shown on launch and by "Start page": big targets for a remote-driven cursor.
 START_HTML = """<!doctype html>
-<html lang="en-GB"><head><meta charset="utf-8"><title>Start</title>
+<html lang="en-GB"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Start</title>
 <style>
 :root { --base:#1a141b; --surface:#251d26; --raised:#2f2530; --line:#3b2f3a; --text:#f0e4d4; --muted:#b5a698; --amber:#e89b5e; }
 * { box-sizing: border-box; }
@@ -244,6 +248,17 @@ a.tile { display: flex; flex-direction: column; align-items: center; gap: 10px; 
 a.tile:hover { background: var(--raised); border-color: var(--amber); transform: translateY(-2px); }
 .icon { width: 54px; height: 54px; border-radius: 14px; background: #f6efe6; display: grid; place-items: center; }
 .icon img { width: 34px; height: 34px; }
+.head { display: flex; align-items: baseline; justify-content: space-between; margin: 24px 4px 12px; }
+.head h2 { margin: 0; }
+.head a { color: var(--amber); font-size: 15px; font-weight: 600; text-decoration: none; padding: 4px 10px; border-radius: 999px; }
+.head a:hover { background: var(--raised); }
+.recent { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; }
+a.page { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 9px 14px; border-radius: 16px;
+  background: var(--surface); border: 1px solid var(--line); color: var(--text); text-decoration: none; }
+a.page:hover { background: var(--raised); border-color: var(--amber); }
+.letter { flex: none; width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+  font-size: 16px; font-weight: 700; color: #fff; }
+.page span:last-child { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 15px; font-weight: 500; }
 .tip { margin-top: 20px; text-align: center; color: var(--muted); font-size: 14px; }
 .tip b { color: var(--text); font-weight: 600; }
 </style></head>
@@ -256,6 +271,7 @@ a.tile:hover { background: var(--raised); border-color: var(--amber); transform:
   </form>
   <h2>Favourites</h2>
   <div class="grid">%TILES%</div>
+  %RECENT%
   <p class="tip">Press <b>Play/Pause</b> to search from any page, <b>&#x2731;</b> for the menu, and <b>Back</b> to go back.</p>
 </main>
 <script>
@@ -281,6 +297,258 @@ FAVOURITES = [
     ("Wikipedia", "https://en.wikipedia.org"), ("Reddit", "https://www.reddit.com"),
     ("Twitch", "https://www.twitch.tv"), ("Google Maps", "https://www.google.com/maps"),
 ]
+HISTORY_HTML = """<!doctype html>
+<html lang="en-GB"><head><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>History</title>
+<style>
+:root { --base:#1a141b; --surface:#251d26; --raised:#2f2530; --line:#3b2f3a; --text:#f0e4d4; --muted:#b5a698; --amber:#e89b5e; }
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; color: var(--text); font-family: Inter, system-ui, sans-serif;
+  background: radial-gradient(900px 480px at 50% -12%, #43291f 0%, var(--base) 62%) fixed, var(--base); }
+main { max-width: 880px; margin: 0 auto; padding: 30px 28px 48px; }
+header { display: flex; align-items: center; gap: 16px; }
+h1 { flex: 1; margin: 0; font-size: 44px; font-weight: 600; letter-spacing: -1.2px; }
+button { font: 600 16px Inter, system-ui, sans-serif; color: var(--text); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 999px; padding: 13px 24px; cursor: pointer; }
+button:hover { border-color: var(--amber); }
+button.armed { background: var(--amber); border-color: var(--amber); color: var(--base); }
+form { margin: 22px 0 6px; position: relative; }
+form svg { position: absolute; left: 22px; top: 50%; transform: translateY(-50%); }
+input { width: 100%; font: 500 20px Inter, system-ui, sans-serif; color: var(--text); padding: 15px 24px 15px 58px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--surface); outline: none; }
+input::placeholder { color: var(--muted); }
+input:hover, input:focus { border-color: var(--amber); box-shadow: 0 0 0 4px rgba(232,155,94,.18); }
+h2 { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin: 26px 0 6px 16px; }
+a.row { display: flex; align-items: center; gap: 16px; padding: 9px 16px; border-radius: 16px; color: var(--text); text-decoration: none; }
+a.row:hover { background: var(--raised); box-shadow: inset 0 0 0 1px var(--amber); }
+.letter { flex: none; width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
+  font-size: 17px; font-weight: 700; color: #fff; }
+.text { flex: 1; min-width: 0; }
+.title, .host { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.title { font-size: 18px; font-weight: 500; }
+.host { font-size: 14px; color: var(--muted); margin-top: 2px; }
+.time { flex: none; font-size: 15px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.empty { text-align: center; color: var(--muted); margin-top: 64px; font-size: 17px; }
+</style></head>
+<body><main>
+  <header><h1>History</h1><button id="clear" type="button">Clear history</button></header>
+  <form id="f" autocomplete="off">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#e89b5e" stroke-width="2.4" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/></svg>
+    <input id="q" type="search" placeholder="Search your history" aria-label="Search your history">
+  </form>
+  <div id="list"></div>
+  <p class="empty" id="empty"></p>
+</main>
+<script>
+const ENTRIES = %ENTRIES%, TOKEN = %TOKEN%;
+const list = document.getElementById('list'), q = document.getElementById('q');
+const empty = document.getElementById('empty'), clear = document.getElementById('clear');
+const hostOf = u => { try { return new URL(u).hostname.replace(/^www\\./, ''); } catch (e) { return u; } };
+const hue = s => { let h = 0; for (const c of s) h = (h * 31 + c.codePointAt(0)) % 360; return h; };
+// The site's own name: wikipedia in en.wikipedia.org, bbc in bbc.co.uk.
+const siteName = host => {
+  const p = host.split('.');
+  if (p.length < 2) return host;
+  const short = p.length > 2 && p[p.length - 1].length === 2 && /^(co|com|org|net|ac|gov|edu|ltd|plc|me)$/.test(p[p.length - 2]);
+  return p[p.length - (short ? 3 : 2)];
+};
+function day(t) {
+  const d = new Date(t * 1000), today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const ago = Math.round((today - new Date(d.getFullYear(), d.getMonth(), d.getDate())) / 864e5);
+  if (ago <= 0) return 'Today';
+  if (ago === 1) return 'Yesterday';
+  return d.toLocaleDateString('en-GB', {weekday: 'long', day: 'numeric', month: 'long',
+    year: d.getFullYear() === today.getFullYear() ? undefined : 'numeric'});
+}
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+// Titles come from websites, so they only ever go in as text.
+function render() {
+  const words = q.value.trim().toLowerCase();
+  list.textContent = '';
+  let heading = null, shown = 0;
+  for (const e of ENTRIES) {
+    if (words && !(e.title + ' ' + e.url).toLowerCase().includes(words)) continue;
+    const label = day(e.t);
+    if (label !== heading) { list.append(el('h2', '', label)); heading = label; }
+    const host = hostOf(e.url), name = siteName(host), a = el('a', 'row');
+    const letter = el('span', 'letter', (name[0] || '?').toUpperCase());
+    a.href = e.url;
+    letter.style.background = `hsl(${hue(name)} 42% 40%)`;
+    const text = el('span', 'text');
+    text.append(el('div', 'title', e.title || host), el('div', 'host', host));
+    a.append(letter, text, el('span', 'time', new Date(e.t * 1000).toLocaleTimeString('en-GB', {hour: '2-digit', minute: '2-digit'})));
+    list.append(a);
+    shown++;
+  }
+  empty.textContent = shown ? '' : words ? 'Nothing in your history matches \\u201c' + q.value.trim() + '\\u201d.'
+    : 'Pages you visit will be listed here.';
+  clear.hidden = !ENTRIES.length;
+}
+q.addEventListener('input', render);
+document.getElementById('f').addEventListener('submit', e => e.preventDefault());
+// Two presses, since a dialog can't ask on the TV.
+let armed = 0;
+clear.addEventListener('click', async () => {
+  if (Date.now() - armed > 5000) {
+    armed = Date.now();
+    clear.textContent = 'Press again to clear';
+    clear.classList.add('armed');
+    setTimeout(() => { if (Date.now() - armed >= 5000) { clear.textContent = 'Clear history'; clear.classList.remove('armed'); } }, 5050);
+    return;
+  }
+  const r = await fetch('/history/clear', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                           body: JSON.stringify({token: TOKEN})});
+  if (r.ok) { ENTRIES.length = 0; q.value = ''; render(); }
+});
+render();
+</script></body></html>"""
+HISTORY_DAYS = 90
+HISTORY_MAX = 3000
+# Brave's own record of the same pages, wiped (when it isn't running) on Clear history.
+BRAVE_HISTORY = ("History", "History-journal", "Visited Links", "Top Sites", "Top Sites-journal")
+
+
+def site_name(host):
+    """The site's own name, for its letter badge: wikipedia in en.wikipedia.org, bbc in
+    bbc.co.uk. The history page works it out the same way."""
+    p = host.split(".")
+    if len(p) < 2:
+        return host
+    short = len(p) > 2 and len(p[-1]) == 2 and p[-2] in ("co", "com", "org", "net", "ac", "gov", "edu", "ltd", "plc", "me")
+    return p[-3 if short else -2]
+
+
+def letter_hue(name):
+    h = 0
+    for c in name:
+        h = (h * 31 + ord(c)) % 360
+    return h
+
+
+class History:
+    """Pages the full browser showed, newest first, one entry per address: going back to
+    a page moves it to the top. Kept in this laptop's private data (mode 600), for 90 days."""
+
+    def __init__(self, path):
+        self.path = path
+        self.entries = []               # {"url", "title", "t"}
+        self.last = None                # (tab, time) the newest entry was added
+        self.saver = None
+        try:
+            data = json.loads(path.read_text())
+            self.entries = [e for e in data.get("entries", [])
+                            if isinstance(e, dict) and str(e.get("url", "")).startswith(("http://", "https://"))]
+        except FileNotFoundError:
+            self.entries = self.from_brave(DATA / "profile")
+            if self.entries:
+                log.info("history: %d pages brought over from the browser's own history", len(self.entries))
+                self.save()
+        except (ValueError, AttributeError):
+            pass
+        self._trim()
+
+    @classmethod
+    def from_brave(cls, profile):
+        """The pages visited before this list existed, from Brave's own database (read
+        from a private copy: Brave keeps the file locked while it runs)."""
+        source = profile / "Default" / "History"
+        if not source.exists():
+            return []
+        copy = DATA / "history-import.tmp"
+        try:
+            with os.fdopen(os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                f.write(source.read_bytes())
+            db = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+            try:
+                rows = db.execute("SELECT url, title, last_visit_time FROM urls WHERE hidden = 0 "
+                                  "ORDER BY last_visit_time DESC LIMIT ?", (HISTORY_MAX * 2,)).fetchall()
+            finally:
+                db.close()
+        except (OSError, sqlite3.Error):
+            return []
+        finally:
+            copy.unlink(missing_ok=True)
+        entries, seen = [], set()
+        for url, title, t in rows:
+            if not url.startswith(("http://", "https://")) or url.startswith("http://127.0.0.1"):
+                continue
+            key = cls.key(url)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"url": url, "title": cls.clean_title(url, title or ""),
+                            "t": round(t / 1e6 - 11644473600)})   # Brave counts microseconds from 1601
+        return entries
+
+    @staticmethod
+    def clean_title(url, title):
+        bare = re.sub(r"^https?://", "", url).rstrip("/")
+        return "" if title.rstrip("/") in (url, bare) else title
+
+    @staticmethod
+    def key(url):
+        return url.split("#", 1)[0]
+
+    def visit(self, url, title, tab=None):
+        if not url.startswith(("http://", "https://")):
+            return
+        title = self.clean_title(url, title)   # the browser shows the address until a page names itself
+        key, top, now = self.key(url), (self.entries[0] if self.entries else None), time.time()
+        if top and self.key(top["url"]) == key:
+            if (title and title != top["title"]) or url != top["url"]:
+                top["title"] = title or top["title"]
+                top["url"] = url
+                self._save_soon()
+            return
+        if top and not top["title"] and self.last and self.last[0] == tab and now - self.last[1] < 3:
+            self.entries.pop(0)         # a redirect on the way here, not a page anyone saw
+        self.entries = [e for e in self.entries if self.key(e["url"]) != key]
+        self.entries.insert(0, {"url": url, "title": title, "t": round(now)})
+        self.last = (tab, now)
+        self._trim()
+        self._save_soon()
+
+    def recent(self, n):
+        return [e for e in self.entries if e["title"]][:n]
+
+    def clear(self):
+        self.entries, self.last = [], None
+        self.save()
+        flag = DATA / "wipe-brave-history"
+        flag.touch()
+        os.chmod(flag, 0o600)
+
+    def _trim(self):
+        oldest = time.time() - HISTORY_DAYS * 86400
+        self.entries = [e for e in self.entries[:HISTORY_MAX] if e.get("t", 0) >= oldest]
+
+    def _save_soon(self):
+        if self.saver is None:
+            self.saver = asyncio.get_running_loop().call_later(2, self.save)
+
+    def save(self):
+        if self.saver is not None:
+            self.saver.cancel()
+            self.saver = None
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump({"entries": self.entries}, f, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
+    @staticmethod
+    def wipe_brave(profile):
+        """Brave keeps its own list of the same pages; Clear history takes that too, at the
+        next start, since Brave holds the files open while it runs."""
+        flag = DATA / "wipe-brave-history"
+        if flag.exists():
+            for name in BRAVE_HISTORY:
+                (profile / "Default" / name).unlink(missing_ok=True)
+            flag.unlink(missing_ok=True)
 
 
 class CDPError(Exception):
@@ -479,6 +747,30 @@ def hls_choice(text, base):
     return uri, urljoin(base, track["URI"])
 
 
+def carry_query(child, parent):
+    """A variant of a tokened master playlist, with the master's token if it has none."""
+    c, p = urlparse(child), urlparse(parent)
+    if c.query or not p.query or c.netloc != p.netloc:
+        return child
+    return child + "?" + p.query
+
+
+def with_query(text, url):
+    """A media playlist with every part (segments, keys, init sections) made absolute and
+    given the playlist's own query when it has none."""
+    def fix(uri):
+        full = urljoin(url, uri)
+        return carry_query(full, url)
+    out = []
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            line = fix(line.strip())
+        elif line.startswith(("#EXT-X-KEY", "#EXT-X-MAP", "#EXT-X-SESSION-KEY")):
+            line = re.sub(r'URI="([^"]+)"', lambda mm: f'URI="{fix(mm.group(1))}"', line)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def format_for(path_or_url):
     return EXT_FORMAT.get(Path(urlparse(str(path_or_url)).path).suffix.lower())
 
@@ -508,6 +800,8 @@ class Browser:
         self.private_contexts = set()   # browser contexts whose tabs never reach the TV
         self.listeners = {}             # session -> callback(method, params), for those tabs
         self.request_headers = {}       # (session, request id) -> headers that matter for replaying it
+        self.maybe_lists = {}           # (session, request id) -> (target, url): text that may be a playlist
+        self.relays = {}                # name -> playlist text this laptop serves to ffmpeg (see _relay)
         self.last_click = 0.0           # videos only go to the TV's player when the user started them
         self.handoff = None             # the page video now playing in the TV's player
         self.declined = set()           # page videos the viewer came back from (Back)
@@ -539,6 +833,8 @@ class Browser:
         self.roku_cache = {}
         self.files = {}                 # token -> local file being played on the TV
         self.boot = secrets.token_hex(3)  # lets the channel tell frames from a previous run apart
+        self.visits = History(DATA / "history.json")
+        self.history_token = secrets.token_urlsafe(16)  # only the history page itself may clear it
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -564,6 +860,7 @@ class Browser:
         port_file = profile / "DevToolsActivePort"
         port_file.unlink(missing_ok=True)
         kill_stale_browser(profile)
+        History.wipe_brave(profile)
         # Brave would reopen every old tab; we restore just the last page ourselves.
         shutil.rmtree(profile / "Default" / "Sessions", ignore_errors=True)
         args = [
@@ -722,6 +1019,7 @@ class Browser:
             t = p["targetInfo"]
             if t["targetId"] in self.info:
                 self.info[t["targetId"]] = {"url": t["url"], "title": t["title"]}
+                self._note_visit(t["targetId"])
                 if t["targetId"] == self.active:
                     self._save_session()
                     self.bump()
@@ -740,8 +1038,13 @@ class Browser:
             # An embedded frame: only its streams and its playing media matter.
             tid = self.frames.get(session)
             if tid is None or method not in ("Network.requestWillBeSent", "Network.responseReceived",
-                                             "Runtime.bindingCalled"):
+                                             "Network.loadingFinished", "Runtime.bindingCalled"):
                 return
+        if method == "Network.loadingFinished":
+            maybe = self.maybe_lists.pop((session, p["requestId"]), None)
+            if maybe and p.get("encodedDataLength", 0) < 4 << 20:
+                asyncio.create_task(self._sniff_body(maybe[0], session, p["requestId"], maybe[1]))
+            return
         if method == "Network.requestWillBeSent":
             h = {k.lower(): v for k, v in p["request"].get("headers", {}).items()}
             keep = {k: h[k] for k in ("referer", "origin", "user-agent") if k in h}
@@ -904,10 +1207,16 @@ class Browser:
         new = {"url": t["url"], "title": t["title"]}
         if tid in self.info and self.info[tid] != new:
             self.info[tid] = new
+            self._note_visit(tid)
             if tid == self.active:
                 self._save_session()
                 self.bump()
         await self._refresh_history(tid, only_if_changed=True)
+
+    def _note_visit(self, tid):
+        info = self.info.get(tid)
+        if info and not info["url"].startswith(self.own_url()):
+            self.visits.visit(info["url"], info["title"], tid)
 
     async def _refresh_history(self, tid, only_if_changed=False):
         try:
@@ -1011,6 +1320,8 @@ class Browser:
         host = (urlparse(url).hostname or "").removeprefix("www.")
         if url.startswith(self.start_url()):
             title, host = "Start", ""
+        elif url.startswith(self.history_url()):
+            title, host = "History", ""
         if not title or title in (url, host) or title.startswith(host + "/"):
             title = ""
         label = "  ·  ".join(x for x in (title, host) if x) or "Loading…"
@@ -1109,8 +1420,14 @@ class Browser:
         if enter:
             await self.press("Enter")
 
+    def own_url(self):
+        return f"http://127.0.0.1:{self.cfg['port']}/"
+
     def start_url(self):
-        return f"http://127.0.0.1:{self.cfg['port']}/start"
+        return self.own_url() + "start"
+
+    def history_url(self):
+        return self.own_url() + "history"
 
     def home_url(self):
         return self.start_url() if self.cfg["home"] == "start" else self.cfg["home"]
@@ -1221,6 +1538,8 @@ class Browser:
             await self.navigate(q.get("q", ""))
         elif t == "home":
             await self.navigate(self.home_url())
+        elif t == "history":
+            await self.navigate(self.history_url())
         elif t == "back":
             return {"went": await self.go_back()}
         elif t == "forward":
@@ -1272,18 +1591,37 @@ class Browser:
             fmt = ext_fmt
         if not fmt and p.get("type") == "Media" and (mime.startswith("video/") or ext_fmt):
             fmt = ext_fmt or "mp4"
-        if not fmt:
-            return
+        if not fmt and p.get("type") in ("XHR", "Fetch") and mime in VAGUE_MIME:
+            # Some players hide the playlist: no .m3u8 name, sent as plain text. Its first
+            # line gives it away once it has arrived.
+            self.maybe_lists[(session, p["requestId"])] = (tid, url)
+            while len(self.maybe_lists) > 200:
+                self.maybe_lists.pop(next(iter(self.maybe_lists)))
+        if fmt:
+            self._found(tid, session, p["requestId"], url, fmt)
+
+    def _found(self, tid, session, request_id, url, fmt, body=None):
         found = self.media.setdefault(tid, [])
         if any(m["url"] == url for m in found):
             return
-        found.append({"url": url, "format": fmt, "session": session, "request": p["requestId"],
-                      "seen": time.monotonic(),
-                      "headers": self.request_headers.get((session, p["requestId"]), {})})
+        m = {"url": url, "format": fmt, "session": session, "request": request_id, "seen": time.monotonic(),
+             "headers": self.request_headers.get((session, request_id), {})}
+        if body is not None:
+            m["body"] = body
+        found.append(m)
         del found[:-40]
         log.info("found %s stream on page: %s", fmt, url[:120])
         if tid == self.active:
             self.bump()
+
+    async def _sniff_body(self, tid, session, request_id, url):
+        try:
+            r = await self.call("Network.getResponseBody", {"requestId": request_id}, session, timeout=5)
+            body = base64.b64decode(r["body"]).decode(errors="replace") if r.get("base64Encoded") else r["body"]
+        except (CDPError, KeyError, ValueError, asyncio.TimeoutError):
+            return
+        if body.lstrip("\ufeff \r\n").startswith("#EXTM3U"):
+            self._found(tid, session, request_id, url, "hls", body)
 
     async def hand_off(self, session=None, info=None):
         """Plays the page's video in the TV's own player, smooth and with sound, and pauses
@@ -1468,18 +1806,48 @@ class Browser:
         if cookies:
             headers.append("Cookie: " + "; ".join(f"{c['name']}={c['value']}" for c in cookies))
         url, audio = m["url"], None
+        ua = h.get("user-agent") or self.ua
         if m["format"] == "hls":
             text = await self._body(m)
             if text:
                 url, audio = hls_choice(text, m["url"])
-        ua = h.get("user-agent") or self.ua
+                url = await self._relay(carry_query(url, m["url"]), headers, ua)
+                if audio:
+                    audio = await self._relay(carry_query(audio, m["url"]), headers, ua)
+        hls = m["format"] == "hls"
         # The copy starts at the keyframe at or before `start`; that's where the TV's
         # timeline begins, for subtitles and for picking up again in the page.
         key, start = await asyncio.gather(
-            self.remuxer.start(url, headers=headers, start=start, user_agent=ua, audio=audio),
-            Remuxer.keyframe(url, headers, start, ua))
+            self.remuxer.start(url, headers=headers, start=start, user_agent=ua, audio=audio, hls=hls),
+            Remuxer.keyframe(url, headers, start, ua, hls=hls))
         return {"url": f"{self.base_url()}/remux/{key}/index.m3u8", "format": "hls", "headers": [],
                 "title": info.get("title", ""), "page": True}, start
+
+    async def _relay(self, url, headers, ua):
+        """A playlist whose parts need its own ?token=… (the page's player adds it to each
+        request; ffmpeg won't): fetched here, the token written in, and served to ffmpeg from
+        this laptop. Over HTTP, not as a file, so ffmpeg still sends the page's headers when
+        it fetches the parts. Anything else is left to ffmpeg as it is."""
+        if not urlparse(url).query:
+            return url
+        try:
+            async with self.http.get(url, headers={"User-Agent": ua or "Mozilla/5.0",
+                                                   **dict(h.split(": ", 1) for h in headers)},
+                                     timeout=aiohttp.ClientTimeout(total=15)) as r:
+                text = await r.text(errors="replace") if r.status == 200 else ""
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return url
+        if not text.lstrip("\ufeff \r\n").startswith("#EXTM3U") or "#EXT-X-ENDLIST" not in text:
+            return url                  # a live list keeps changing; ffmpeg must read it itself
+        rewritten = with_query(text, url)
+        if rewritten == text:
+            return url
+        name = hashlib.sha1(url.encode()).hexdigest()[:16]
+        self.relays[name] = rewritten
+        while len(self.relays) > 6:
+            self.relays.pop(next(iter(self.relays)))
+        log.info("playlist parts need its token; relaying %s", url[:100])
+        return f"{self.own_url()}relay/{name}.m3u8"
 
     async def _subtitles(self, tid, session):
         """The subtitles of the video now playing, as (cues, label, language): the lines of
@@ -1621,6 +1989,9 @@ class Browser:
 
 # Dailymotion serves the Roku as itself; its CDN refuses a Roku that claims to be Chrome.
 ROKU_UA = "Roku/DVP-15.3"
+# Read as HLS whatever the name or type says: players hide playlists as text/plain, and
+# their parts as page-1.html.
+HLS_INPUT = ["-f", "hls", "-allowed_extensions", "ALL"]
 
 
 class Renderer:
@@ -1697,7 +2068,7 @@ class Remuxer:
         self.proc = None
         self.dir = DATA / "remux"
 
-    async def start(self, url, headers=(), start=0.0, user_agent=ROKU_UA, audio=None):
+    async def start(self, url, headers=(), start=0.0, user_agent=ROKU_UA, audio=None, hls=False):
         key = hashlib.sha1(f"{url} {audio} {start:.1f}".encode()).hexdigest()[:12]
         out = self.dir / key
         alive = self.proc is not None and self.proc.returncode is None
@@ -1717,6 +2088,8 @@ class Remuxer:
                 source += ["-headers", "".join(h + "\r\n" for h in headers)]
             if start:
                 source += ["-ss", f"{start:.2f}"]
+            if hls:
+                source += HLS_INPUT         # whatever its name and type say
             inputs = [*source, "-i", url]
             if audio:
                 inputs += [*source, "-i", audio, "-map", "0:v:0", "-map", "1:a:0"]
@@ -1742,7 +2115,7 @@ class Remuxer:
         raise web.HTTPGatewayTimeout(text="the stream took too long to start")
 
     @staticmethod
-    async def keyframe(url, headers=(), start=0.0, user_agent=ROKU_UA):
+    async def keyframe(url, headers=(), start=0.0, user_agent=ROKU_UA, hls=False):
         """Where a copy asked to start at `start` really starts: the keyframe at or
         before it, which is what ffmpeg's seek lands on (ffprobe seeks the same way).
         Subtitles are timed against it."""
@@ -1751,6 +2124,8 @@ class Remuxer:
         args = ["ffprobe", "-v", "error", "-user_agent", user_agent]
         if headers:
             args += ["-headers", "".join(h + "\r\n" for h in headers)]
+        if hls:
+            args += HLS_INPUT
         args += ["-read_intervals", f"{start:.2f}%+#1", "-select_streams", "v:0", "-skip_frame", "nokey",
                  "-show_entries", "frame=pts_time", "-of", "csv=p=0", url]
         out = await command_output(*args, timeout=15)
@@ -2208,8 +2583,50 @@ def make_app(b):
             f'<a class="tile" href="{url}"><span class="icon"><img alt="" '
             f'src="https://www.google.com/s2/favicons?domain={urlparse(url).hostname}&sz=128"></span>{name}</a>'
             for name, url in FAVOURITES)
-        page = START_HTML.replace("%TILES%", tiles).replace("%SEARCH%", json.dumps(b.cfg["search"]))
-        return web.Response(text=page, content_type="text/html")
+        recent = ""
+        pages = b.visits.recent(4)
+        if pages:
+            recent = ('<div class="head"><h2>Recent</h2><a href="/history">All history</a></div><div class="recent">'
+                      + "".join(page_link(e) for e in pages) + "</div>")
+        page = (START_HTML.replace("%TILES%", tiles).replace("%RECENT%", recent)
+                .replace("%SEARCH%", json.dumps(b.cfg["search"])))
+        return web.Response(text=page, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+    def page_link(e):
+        name = site_name((urlparse(e["url"]).hostname or "").removeprefix("www."))
+        return (f'<a class="page" href="{html.escape(e["url"])}"><span class="letter" '
+                f'style="background:hsl({letter_hue(name)} 42% 40%)">{html.escape((name[:1] or "?").upper())}</span>'
+                f'<span>{html.escape(e["title"])}</span></a>')
+
+    def script_json(value):
+        # Inside <script>, "</" could end it early; titles come from websites.
+        return json.dumps(value, ensure_ascii=False).replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+
+    async def relay(req):
+        text = b.relays.get(req.match_info["name"])
+        if text is None or req.remote not in ("127.0.0.1", "::1"):
+            raise web.HTTPNotFound()
+        return web.Response(text=text, content_type="application/vnd.apple.mpegurl")
+
+    async def history(req):
+        if req.remote not in ("127.0.0.1", "::1"):
+            raise web.HTTPNotFound()    # for the hidden browser only
+        page = (HISTORY_HTML.replace("%TOKEN%", json.dumps(b.history_token))
+                .replace("%ENTRIES%", script_json(b.visits.entries)))
+        return web.Response(text=page, content_type="text/html", headers={"Cache-Control": "no-store"})
+
+    async def history_clear(req):
+        try:
+            token = (await req.json()).get("token", "")
+        except (ValueError, AttributeError):
+            token = ""
+        if req.remote not in ("127.0.0.1", "::1") or not secrets.compare_digest(str(token), b.history_token):
+            raise web.HTTPForbidden()
+        b.visits.clear()
+        if not b.running:
+            History.wipe_brave(DATA / "profile")
+        log.info("history cleared")
+        return web.json_response({"ok": True})
 
     def frame_number(req):
         try:
@@ -2426,7 +2843,9 @@ def make_app(b):
     b.mirror = mirror
     app = web.Application(middlewares=[guard])
     app.add_routes([
-        web.get("/hello", hello), web.get("/start", start), web.get("/poll", poll), web.get(r"/frame/{n}.jpg", frame),
+        web.get("/hello", hello), web.get("/start", start),
+        web.get("/history", history), web.post("/history/clear", history_clear),
+        web.get("/relay/{name}.m3u8", relay), web.get("/poll", poll), web.get(r"/frame/{n}.jpg", frame),
         web.get(r"/patch/{n}.jpg", patch),
         web.get("/input", input_), web.get("/state", state), web.post("/open", open_),
         web.post("/type", type_), web.post("/cast", cast), web.get("/file/{token}/{name}", file),
@@ -2481,6 +2900,7 @@ async def main():
     b.remuxer.stop()
     await b.mirror.stop()
     await b.stop()
+    b.visits.save()
     await b.http.close()
     await runner.cleanup()
 

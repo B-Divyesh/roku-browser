@@ -201,10 +201,10 @@ setup if you only want Lite mode.
 | Remote button | Does |
 |---|---|
 | Arrows | Move the cursor (hold to speed up). Links and buttons light up under it; push past an edge to scroll |
-| Cursor to the top edge | The top bar: back, forward, reload, the address (OK to search or type one) and the search engine |
+| Cursor to the top edge | The top bar: back, forward, reload, the address (OK to search or type one), History and the search engine |
 | OK | Click. Clicking a text box opens the keyboard |
 | Play/Pause | Search or type an address |
-| ✱ (Options) | Menu: search, play the page's video on the TV, show the laptop's screen, forward, reload, text size, start page, exit |
+| ✱ (Options) | Menu: search, play the page's video on the TV, History, show the laptop's screen, forward, reload, text size, start page, exit |
 | Rewind / Fast-forward | Page up / page down |
 | Instant replay ↺ | Reload |
 | Back | Go back; press twice on the first page to exit |
@@ -222,6 +222,14 @@ drawn by the app as white text with a dark outline and nothing behind it, whatev
 caption settings. While watching, ✱ offers *Subtitles* on or off, *Watch from the beginning* and
 *Start at a time…* (type minutes, or minutes:seconds). **Back** returns to the page, paused where
 you stopped. If a video stays in the page, ✱ → *Play video on TV* does the same by hand.
+
+**History.** Every page the full browser shows is listed, newest first and grouped by day,
+under ✱ → *History*, the top bar's *History* button, or *All history* on the start page (which
+also shows the last four pages). Its search box finds a page by title or address. Going back
+to a page moves it to the top rather than listing it twice. Entries are kept for 90 days. *Clear
+history* (press it twice) empties the list, and also Brave's own record of the same pages
+the next time the hidden browser starts. Lite mode keeps a short list of its own (the last 60
+pages) on the Roku, under its ✱ → *History*.
 
 In **Lite mode** the same buttons apply, except that the arrows move between links, boxes and
 videos instead of a cursor: Up and Down go to the nearest one above or below (and scroll
@@ -324,6 +332,9 @@ Roku's player always keeps a few seconds in hand, and needs `wf-recorder`.
   `~/.local/share/roku-browser/profile`, separate from your normal browser.
 - The service only answers this laptop and Roku devices. Before serving any other address
   on the network, it checks that the address really is a Roku.
+- History is kept on the laptop in `~/.local/share/roku-browser/history.json` (mode 600),
+  for 90 days. Only the hidden browser can see the History page, and only that page can
+  clear it. Links on it and on the start page don't tell sites where you came from.
 - The hidden browser closes after 15 minutes without use.
 - Mirroring sends your screen only to the Roku you set up. Over AirPlay it's encrypted, and
   the TV asks for a pairing code the first time. In the fallback, the stream's address is a
