@@ -162,6 +162,139 @@ SUBTITLES_JS = r"""(() => {
   return {label: t.label, language: t.language, cues: [...t.cues].map(c => [c.startTime, c.endTime, c.text])};
 })()"""
 
+# Sites built on one big film catalogue (today's 123Movies, MovieBox and their copies) keep
+# each dubbed version of a film as a film of its own. The page's data lists them, but on
+# the web nothing offers them, so this puts the choice under the player: plain links, which
+# the TV's cursor can click like any other. Same episode, in the other language.
+DUBS_JS = r"""(() => {
+  if (window !== top || window.__rokuBrowserDubs) return;
+  window.__rokuBrowserDubs = true;
+  // Its own kind of element: a page that builds itself over the markup it was sent
+  // (as these do) takes a plain <div> found in its way for one of its own.
+  const ROW = 'roku-browser-dubs';
+  const nuxt = () => { try { return typeof useNuxtApp === 'function' ? useNuxtApp() : null; } catch (e) { return null; } };
+  const stores = () => {
+    const out = [];
+    const app = nuxt();
+    if (app) out.push(app.payload);
+    try { out.push(document.getElementById('__nuxt').__vue_app__.config.globalProperties.$nuxt.payload); } catch (e) {}
+    out.push(window.__NUXT__);
+    return out.filter(Boolean);
+  };
+  // Each version's address ends in a code of its own; the words before it vary.
+  const code = path => String(path || '').split('-').pop();
+  const isHere = (v, id, slug) => v && (String(v.subjectId) === id || (slug && code(v.detailPath) === code(slug)));
+  // The film's versions: a "dubs" list that has the film on this page in it.
+  const versions = () => {
+    const id = new URLSearchParams(location.search).get('id');
+    const slug = location.pathname.split('/').pop();
+    const seen = new Set();
+    let found = null, budget = 30000;
+    const walk = (o, depth) => {
+      if (found || !o || typeof o !== 'object' || depth > 9 || seen.has(o) || --budget < 0) return;
+      seen.add(o);
+      const d = o.dubs;
+      if (Array.isArray(d) && d.length > 1 &&
+          d.some(x => isHere(x, id, slug))) {
+        found = d;
+        return;
+      }
+      for (const k in o) { try { walk(o[k], depth + 1); } catch (e) {} }
+    };
+    for (const s of stores()) walk(s, 0);
+    return found;
+  };
+  const episode = () => {
+    for (const s of stores()) {
+      const p = s.state && s.state.$sdata;
+      if (p && Number(p.curSe) > 0 && Number(p.curEp) > 0) return p;
+    }
+    return null;
+  };
+  const languages = (() => { try { return new Intl.DisplayNames(['en'], {type: 'language'}); } catch (e) { return null; } })();
+  const name = v => {
+    if (v.original) {
+      let lang = '';
+      try { lang = languages && v.lanCode ? languages.of(v.lanCode) : ''; } catch (e) {}
+      return lang && lang !== v.lanCode ? lang + ' (original)' : 'Original';
+    }
+    return String(v.lanName || v.lanCode || '?').replace(/\s*dub(bed)?$/i, '');
+  };
+  const build = all => {
+    const id = new URLSearchParams(location.search).get('id');
+    const slug = location.pathname.split('/').pop();
+    const here = all.find(v => isHere(v, id, slug));
+    // Dubbed versions only: the "sub" ones have the original sound.
+    const list = all.filter(v => v && (v.original || v === here || (v.type !== undefined ? v.type === 0 : /dub/i.test(v.lanName || ''))));
+    if (list.length < 2) return null;
+    const ep = episode();
+    const row = document.createElement(ROW);
+    row.id = ROW;
+    row.dataset.url = location.href;
+    row.style.cssText = 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0;padding:12px 16px;' +
+      'border-radius:8px;background:#1f1f1f;font:600 15px/1.2 system-ui,sans-serif;color:#fff';
+    const label = document.createElement('span');
+    label.textContent = 'Audio';
+    label.style.cssText = 'color:#9a9a9a;margin-right:6px';
+    row.append(label);
+    for (const v of list) {
+      const current = v === here;
+      const pill = document.createElement(current ? 'span' : 'a');
+      pill.textContent = name(v);
+      pill.style.cssText = 'padding:8px 14px;border-radius:999px;text-decoration:none;color:#fff;' +
+        (current ? 'background:rgba(229,9,20,.18);border:1px solid #e50914' : 'background:rgba(255,255,255,.1);border:1px solid transparent');
+      if (!current) {
+        const u = new URL(location.href);
+        if (here && here.detailPath && v.detailPath && code(slug) === code(here.detailPath))
+          u.pathname = u.pathname.replace(/[^/]*$/, v.detailPath);
+        u.searchParams.set('id', v.subjectId);
+        if (ep && u.searchParams.has('detailEp')) {
+          u.searchParams.set('detailSe', ep.curSe);
+          u.searchParams.set('detailEp', ep.curEp);
+        }
+        pill.href = u.href;
+      } else {
+        pill.setAttribute('aria-current', 'true');
+      }
+      row.append(pill);
+    }
+    return row;
+  };
+  // Below the player and the episode list beside it.
+  const anchor = () => {
+    const box = document.querySelector('.player-container');
+    if (box) return box;
+    let a = document.querySelector('video');
+    while (a && a.parentElement && a.parentElement !== document.body) {
+      const p = a.parentElement, cs = getComputedStyle(p);
+      const sideBySide = cs.display.includes('flex') && !cs.flexDirection.startsWith('column');
+      if (!sideBySide && p.getBoundingClientRect().height > a.getBoundingClientRect().height + 40) break;
+      a = p;
+    }
+    return a;
+  };
+  let url = '', tries = 0;
+  const tick = () => {
+    if (location.href !== url) { url = location.href; tries = 0; }
+    const app = nuxt();
+    if (app && app.isHydrating) return;
+    const old = document.getElementById(ROW);
+    if (old && old.tagName === ROW.toUpperCase() && old.dataset.url === url) return;
+    if (old) old.remove();
+    if (tries++ > 20) return;
+    const all = versions(), at = all && anchor();
+    const row = at && build(all);
+    if (row) { at.after(row); tries = 0; }
+  };
+  // Once the page has loaded and finished building itself.
+  const start = () => {
+    if (!window.__NUXT__ && !document.getElementById('__nuxt') && !document.getElementById('__NUXT_DATA__')) return;
+    setInterval(tick, 1500);
+  };
+  if (document.readyState === 'complete') start();
+  else addEventListener('load', start, {once: true});
+})()"""
+
 def parse_subtitles(text):
     """Cues from an SRT or WebVTT file, as (start, end, text) in seconds."""
     stamp = r"(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{3})"
@@ -188,10 +321,18 @@ def pictures(cues):
 
 def retime(cues, offset):
     """Cues for a copy of the video that starts `offset` seconds into it, as plain text
-    lines (markup such as <i> and {\\an8} taken out): the TV draws them itself."""
-    out = []
+    lines (markup such as <i> and {\\an8} taken out, and line breaks written as <br> or
+    \\N made real ones): the TV draws them itself. A player showing a second language
+    holds every cue twice when both are the same; the TV shows one line at a time, so
+    the repeat goes."""
+    out, seen = [], set()
     for start, end, text in cues:
-        text = re.sub(r"<[^>]*>|\{[^}]*\}", "", text).strip()
+        text = re.sub(r"<br\s*/?>|\\[Nn]", "\n", text, flags=re.I)
+        text = html.unescape(re.sub(r"<[^>]*>|\{[^}]*\}", "", text))
+        text = "\n".join(line.strip() for line in text.split("\n") if line.strip())
+        if (start, end, text) in seen:
+            continue
+        seen.add((start, end, text))
         if end > offset and text:
             out.append([round(max(0.0, start - offset), 2), round(end - offset, 2), text])
     return out
@@ -817,6 +958,7 @@ class Browser:
         self.scroll_y = (0, 0)          # (position, furthest) of the page's scroll, in TV pixels
         self.frame_scroll = 0           # ...and the last one the current frame includes
         self.last_input = 0.0           # scrolling, typing: frames go out fast meanwhile
+        self.asked = False              # the viewer has clicked, typed or gone somewhere
         self.png = b""
         self.links = []                 # clickable rects for the current frame, in 1280x720 coordinates
         self.state_ver = 0
@@ -1141,6 +1283,8 @@ class Browser:
                 ("Runtime.addBinding", {"name": MEDIA_BINDING}),
                 ("Page.addScriptToEvaluateOnNewDocument", {"source": MEDIA_JS}),
                 ("Runtime.evaluate", {"expression": MEDIA_JS}),
+                ("Page.addScriptToEvaluateOnNewDocument", {"source": DUBS_JS}),
+                ("Runtime.evaluate", {"expression": DUBS_JS}),
                 ("Target.setAutoAttach", {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True,
                                           "filter": [{"type": "iframe"}]}),
             ):
@@ -1501,6 +1645,8 @@ class Browser:
             self.recapture()
         if t in ("scroll", "page", "key", "text", "click", "nav"):
             self.last_input = time.monotonic()
+        if t in ("click", "key", "text", "nav", "home", "history", "back", "forward", "reload"):
+            self.asked = True
         if t == "move":
             async with self.pointer():
                 await self.mouse("mouseMoved", self.css(q, "x"), self.css(q, "y"))
@@ -1714,8 +1860,10 @@ class Browser:
         duration, area, src = info.get("duration", -1), info.get("area", 0), info.get("src")
         since_click = time.monotonic() - self.last_click
         # A film or an episode: on a TV it's only worth watching in the TV's player, even if
-        # the page started it by itself, muted, as autoplay has to be.
-        feature = duration >= 480 and area >= 0.45 and src not in self.declined
+        # the page started it by itself, muted, as autoplay has to be. Not before the viewer
+        # has clicked, typed or gone somewhere, though: a film page reopened when the service
+        # starts plays by itself too, and nobody asked for the TV to switch to it.
+        feature = duration >= 480 and area >= 0.45 and src not in self.declined and self.asked
         # Anything else once the viewer starts it (a click, or turning the sound on), unless
         # it's a tiny player or a clip short enough to be an advert or a preview.
         chosen = ((since_click <= 15 or (since_click <= 120 and not info.get("muted")))
@@ -2662,6 +2810,7 @@ def make_app(b):
     async def open_(req):
         body = await req.json()
         await b.ensure()
+        b.asked = True
         await b.navigate(body["q"])
         await b.show_on_tv()
         return web.json_response({"ok": True})
@@ -2700,6 +2849,7 @@ def make_app(b):
                     if fmt else await b.ytdlp(url))
             if not item:
                 await b.ensure()
+                b.asked = True
                 await b.navigate(url)
                 await b.show_on_tv()
                 return web.json_response({"ok": True, "via": "browser"})

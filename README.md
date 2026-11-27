@@ -214,7 +214,8 @@ The cursor fades out when you stop using the remote; any button brings it back.
 **Videos in pages.** The full browser reaches the TV as pictures, which is perfect for reading
 and hopeless for video: a few frames a second, and no sound. So a video in a page moves to the
 Roku's own player instead, smooth and with sound. A film or an episode (8 minutes or more,
-filling much of the page) moves by itself, even when the page starts it muted, as many do;
+filling much of the page) moves by itself, even when the page starts it muted, as many do
+(though not a page that was simply reopened when the laptop started: that waits for you);
 anything shorter moves when you press play or turn its sound on. Adverts and previews stay.
 The laptop fetches the stream the way the page did (players embedded from other sites work too),
 converts the sound to stereo AAC, which every Roku plays, and brings the page's subtitles along:
@@ -222,6 +223,14 @@ drawn by the app as white text with a dark outline and nothing behind it, whatev
 caption settings. While watching, ✱ offers *Subtitles* on or off, *Watch from the beginning* and
 *Start at a time…* (type minutes, or minutes:seconds). **Back** returns to the page, paused where
 you stopped. If a video stays in the page, ✱ → *Play video on TV* does the same by hand.
+
+**Dubs.** Some film sites (the current 123Movies copies, MovieBox and others built on the same
+catalogue) keep each dubbed version of a film as a separate film, and their web pages give no
+way to reach it. The browser adds an *Audio* row under such a player, listing the original and
+every dub the site has (Hindi, French, English and so on, where they exist). Each one opens
+the same episode in that language. Versions marked "sub" have the original sound, so they're
+left out. A film with no dubs gets no row. The labels in the player's own bar, such as
+*English*, are its subtitle settings.
 
 **History.** Every page the full browser shows is listed, newest first and grouped by day,
 under ✱ → *History*, the top bar's *History* button, or *All history* on the start page (which
